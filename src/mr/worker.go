@@ -186,12 +186,12 @@ func CallExample() {
 
 // get task
 func fetchMapTask() (id int, filename string) {
-	args := RPCArgs{}
-	reply := RPCReply{}
+	args := FetchArgs{}
+	reply := MapFetchReply{}
 	ok := call("Coordinator.MapTask", &args, &reply)
 	if ok {
-		id = reply.Y1
-		filename = reply.Y2
+		id = reply.ID
+		filename = reply.Filename
 		// if id > 0 {
 		// 	fmt.Printf("Map:%d fetch with filename%s\n", id, filename)
 		// }
@@ -203,11 +203,11 @@ func fetchMapTask() (id int, filename string) {
 }
 
 func fetchReduceTask() (id int) {
-	args := RPCArgs{}
-	reply := RPCReply{}
+	args := FetchArgs{}
+	reply := ReduceFetchReply{}
 	ok := call("Coordinator.ReduceTask", &args, &reply)
 	if ok {
-		id = reply.Y1
+		id = reply.ID
 		// if id > 0 {
 		// 	fmt.Printf("Reduce:%d fetch\n", id)
 		// }
@@ -220,12 +220,12 @@ func fetchReduceTask() (id int) {
 
 // get nReducer
 func fetchNReduce() int {
-	args := RPCArgs{}
-	reply := RPCReply{}
+	args := FetchArgs{}
+	reply := NumFetchReply{}
 	ok := call("Coordinator.NReduce", &args, &reply)
 	if ok {
 		// fmt.Printf("nReduce fetch\n")
-		return reply.Y1
+		return reply.Num
 	} else {
 		fmt.Printf("call fetchnreduce fail\n")
 	}
@@ -234,21 +234,21 @@ func fetchNReduce() int {
 
 // get nMapTask
 func fetchNMap() int {
-	args := RPCArgs{}
-	reply := RPCReply{}
+	args := FetchArgs{}
+	reply := NumFetchReply{}
 	ok := call("Coordinator.NMap", &args, &reply)
 	if ok {
 		// fmt.Printf("nMap fetch\n")
-		return reply.Y1
+		return reply.Num
 	} else {
 		fmt.Printf("call fetchnreduce fail\n")
 	}
 	return -1
 }
 func completeMap(id int) {
-	args := RPCArgs{}
-	reply := RPCReply{}
-	args.X1 = id
+	args := CompleteArgs{}
+	reply := CompleteReply{}
+	args.ID = id
 	ok := call("Coordinator.CompleteMap", &args, &reply)
 	// fmt.Printf("Map:%d Complete\n", id)
 	if !ok {
@@ -257,9 +257,9 @@ func completeMap(id int) {
 }
 
 func completeReduce(id int) {
-	args := RPCArgs{}
-	reply := RPCReply{}
-	args.X1 = id
+	args := CompleteArgs{}
+	reply := CompleteReply{}
+	args.ID = id
 	ok := call("Coordinator.CompleteReduce", &args, &reply)
 	// fmt.Printf("Reduce:%d Complete\n", id)
 	if !ok {

@@ -62,12 +62,12 @@ func (t mrTask) IsComplete() bool {
 
 // Y1 mapID
 // Y2 mapTaskFileName
-func (h *Coordinator) MapTask(args *RPCArgs, reply *RPCReply) error {
-	reply.Y1 = -1
+func (h *Coordinator) MapTask(args *FetchArgs, reply *MapFetchReply) error {
+	reply.ID = -1
 	h.Lock()
 	if h.mapDone {
 		h.Unlock()
-		reply.Y1 = -2
+		reply.ID = -2
 		return nil
 	}
 	for i := 0; i < len(h.mapStatus); i++ {
@@ -75,16 +75,16 @@ func (h *Coordinator) MapTask(args *RPCArgs, reply *RPCReply) error {
 			continue
 		}
 		// fmt.Printf("assign MapTask:%d\n", i)
-		reply.Y1 = i
-		reply.Y2 = h.mapTask[i]
+		reply.ID = i
+		reply.Filename = h.mapTask[i]
 		h.mapStatus[i].Processing()
 		break
 	}
 	h.Unlock()
-	if reply.Y1 == -1 {
+	if reply.ID == -1 {
 		return nil
 	}
-	p := reply.Y1
+	p := reply.ID
 	go func() {
 		time.Sleep(time.Duration(outTime) * time.Second)
 		h.Lock()
@@ -99,12 +99,12 @@ func (h *Coordinator) MapTask(args *RPCArgs, reply *RPCReply) error {
 
 // Y1 reduceID
 // Y3 reduceTask
-func (h *Coordinator) ReduceTask(args *RPCArgs, reply *RPCReply) error {
-	reply.Y1 = -1
+func (h *Coordinator) ReduceTask(args *FetchArgs, reply *ReduceFetchReply) error {
+	reply.ID = -1
 	h.Lock()
 	if h.reduceDone {
 		h.Unlock()
-		reply.Y1 = -2
+		reply.ID = -2
 		return nil
 	}
 	for i := 0; i < len(h.reduceStatus); i++ {
@@ -112,15 +112,15 @@ func (h *Coordinator) ReduceTask(args *RPCArgs, reply *RPCReply) error {
 			continue
 		}
 		// fmt.Printf("assign ReduceTask:%d\n", i)
-		reply.Y1 = i
+		reply.ID = i
 		h.reduceStatus[i].Processing()
 		break
 	}
 	h.Unlock()
-	if reply.Y1 == -1 {
+	if reply.ID == -1 {
 		return nil
 	}
-	p := reply.Y1
+	p := reply.ID
 	go func() {
 		time.Sleep(time.Duration(outTime) * time.Second)
 		h.Lock()
@@ -134,10 +134,10 @@ func (h *Coordinator) ReduceTask(args *RPCArgs, reply *RPCReply) error {
 }
 
 // X1 mapID
-func (h *Coordinator) CompleteMap(args *RPCArgs, reply *RPCReply) error {
+func (h *Coordinator) CompleteMap(args *CompleteArgs, reply *CompleteReply) error {
 	h.Lock()
 	defer h.Unlock()
-	mapID := args.X1
+	mapID := args.ID
 	h.mapStatus[mapID].Complete()
 	h.mapDone = true
 	for i := range h.mapStatus {
@@ -150,10 +150,10 @@ func (h *Coordinator) CompleteMap(args *RPCArgs, reply *RPCReply) error {
 	return nil
 }
 
-func (h *Coordinator) CompleteReduce(args *RPCArgs, reply *RPCReply) error {
+func (h *Coordinator) CompleteReduce(args *CompleteArgs, reply *CompleteReply) error {
 	h.Lock()
 	defer h.Unlock()
-	reduceID := args.X1
+	reduceID := args.ID
 	h.reduceStatus[reduceID].Complete()
 	h.reduceDone = true
 	for i := range h.reduceStatus {
@@ -166,16 +166,16 @@ func (h *Coordinator) CompleteReduce(args *RPCArgs, reply *RPCReply) error {
 	return nil
 }
 
-func (h *Coordinator) NReduce(args *RPCArgs, reply *RPCReply) error {
+func (h *Coordinator) NReduce(args *FetchArgs, reply *NumFetchReply) error {
 	h.RLock()
-	reply.Y1 = h.nReduce
+	reply.Num = h.nReduce
 	h.RUnlock()
 	return nil
 }
 
-func (h *Coordinator) NMap(args *RPCArgs, reply *RPCReply) error {
+func (h *Coordinator) NMap(args *FetchArgs, reply *NumFetchReply) error {
 	h.RLock()
-	reply.Y1 = h.nMap
+	reply.Num = h.nMap
 	h.RUnlock()
 	return nil
 }

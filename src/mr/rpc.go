@@ -26,14 +26,29 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
-type RPCArgs struct {
-	X1 int // map task id
-	X2 int // reduce task id
+type FetchArgs struct {
+	X interface{}
 }
 
-type RPCReply struct {
-	Y1 int    // task id
-	Y2 string // map task name
+type MapFetchReply struct {
+	ID       int
+	Filename string
+}
+
+type ReduceFetchReply struct {
+	ID int
+}
+
+type NumFetchReply struct {
+	Num int
+}
+
+type CompleteArgs struct {
+	ID int
+}
+
+type CompleteReply struct {
+	X interface{}
 }
 
 // Cook up a unique-ish UNIX-domain socket name
