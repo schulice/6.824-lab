@@ -1,33 +1,194 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
 type Coordinator struct {
 	// Your definitions here.
-
+	sync.RWMutex
+	nReduce      int
+	nMap         int
+	mapTask      []string //taskid filename
+	mapStatus    []mrTask
+	reduceStatus []mrTask
+	mapDone      bool
+	reduceDone   bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-//
+const outTime uint = 10
+
+type mrTask uint8
+
+func (t *mrTask) None() {
+	*t = 0
+}
+
+func (t mrTask) IsNone() bool {
+	return t == mrTask(0)
+}
+
+func (t *mrTask) Idle() {
+	*t = 1
+}
+
+func (t mrTask) IsIdle() bool {
+	return t == mrTask(1)
+}
+
+func (t *mrTask) Processing() {
+	*t = 2
+}
+
+func (t mrTask) IsProcessing() bool {
+	return t == mrTask(2)
+}
+
+func (t *mrTask) Complete() {
+	*t = 3
+}
+
+func (t mrTask) IsComplete() bool {
+	return t == mrTask(3)
+}
+
+// Y1 mapID
+// Y2 mapTaskFileName
+func (h *Coordinator) MapTask(args *RPCArgs, reply *RPCReply) error {
+	reply.Y1 = -1
+	h.Lock()
+	if h.mapDone {
+		h.Unlock()
+		reply.Y1 = -2
+		return nil
+	}
+	for i := 0; i < len(h.mapStatus); i++ {
+		if !(h.mapStatus[i].IsIdle()) {
+			continue
+		}
+		// fmt.Printf("assign MapTask:%d\n", i)
+		reply.Y1 = i
+		reply.Y2 = h.mapTask[i]
+		h.mapStatus[i].Processing()
+		break
+	}
+	h.Unlock()
+	if reply.Y1 == -1 {
+		return nil
+	}
+	p := reply.Y1
+	go func() {
+		time.Sleep(time.Duration(outTime) * time.Second)
+		h.Lock()
+		if !h.mapStatus[p].IsComplete() {
+			// fmt.Printf("outtime MapTask:%d\n", p)
+			h.mapStatus[p].Idle()
+		}
+		h.Unlock()
+	}()
+	return nil
+}
+
+// Y1 reduceID
+// Y3 reduceTask
+func (h *Coordinator) ReduceTask(args *RPCArgs, reply *RPCReply) error {
+	reply.Y1 = -1
+	h.Lock()
+	if h.reduceDone {
+		h.Unlock()
+		reply.Y1 = -2
+		return nil
+	}
+	for i := 0; i < len(h.reduceStatus); i++ {
+		if !(h.reduceStatus[i].IsIdle()) {
+			continue
+		}
+		// fmt.Printf("assign ReduceTask:%d\n", i)
+		reply.Y1 = i
+		h.reduceStatus[i].Processing()
+		break
+	}
+	h.Unlock()
+	if reply.Y1 == -1 {
+		return nil
+	}
+	p := reply.Y1
+	go func() {
+		time.Sleep(time.Duration(outTime) * time.Second)
+		h.Lock()
+		if !h.reduceStatus[p].IsComplete() {
+			h.reduceStatus[p].Idle()
+			// fmt.Printf("task %d not done\n", p)
+		}
+		h.Unlock()
+	}()
+	return nil
+}
+
+// X1 mapID
+func (h *Coordinator) CompleteMap(args *RPCArgs, reply *RPCReply) error {
+	h.Lock()
+	defer h.Unlock()
+	mapID := args.X1
+	h.mapStatus[mapID].Complete()
+	h.mapDone = true
+	for i := range h.mapStatus {
+		if h.mapStatus[i].IsComplete() {
+			continue
+		}
+		h.mapDone = false
+		break
+	}
+	return nil
+}
+
+func (h *Coordinator) CompleteReduce(args *RPCArgs, reply *RPCReply) error {
+	h.Lock()
+	defer h.Unlock()
+	reduceID := args.X1
+	h.reduceStatus[reduceID].Complete()
+	h.reduceDone = true
+	for i := range h.reduceStatus {
+		if h.reduceStatus[i].IsComplete() {
+			continue
+		}
+		h.reduceDone = false
+		break
+	}
+	return nil
+}
+
+func (h *Coordinator) NReduce(args *RPCArgs, reply *RPCReply) error {
+	h.RLock()
+	reply.Y1 = h.nReduce
+	h.RUnlock()
+	return nil
+}
+
+func (h *Coordinator) NMap(args *RPCArgs, reply *RPCReply) error {
+	h.RLock()
+	reply.Y1 = h.nMap
+	h.RUnlock()
+	return nil
+}
+
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
 
-
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -41,29 +202,39 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
-	ret := false
-
+	c.RLock()
+	ret := c.reduceDone
+	c.RUnlock()
 	// Your code here.
-
 
 	return ret
 }
 
-//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	c.nMap = len(files)
+	c.mapTask = make([]string, c.nMap)
+	c.mapStatus = make([]mrTask, c.nMap)
+	for i := range c.mapStatus {
+		c.mapStatus[i].Idle()
+	}
+	c.mapDone = false
+	copy(c.mapTask, files)
 
+	c.nReduce = nReduce
+	c.reduceStatus = make([]mrTask, c.nReduce)
+	for i := range c.reduceStatus {
+		c.reduceStatus[i].Idle()
+	}
+	c.reduceDone = false
 
 	c.server()
 	return &c
