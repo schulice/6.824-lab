@@ -10,8 +10,8 @@ import (
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
-	uid int64
-	order int64
+	uid    int64
+	worder int64
 }
 
 func nrand() int64 {
@@ -26,7 +26,7 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck.server = server
 	// You'll have to add code here.
 	ck.uid = nrand()
-	ck.order = 0
+	ck.worder = 0
 	return ck
 }
 
@@ -43,9 +43,14 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	args := GetArgs{Key: key}
+	args := GetArgs{Key: key, Uid: ck.uid}
 	reply := GetReply{}
-	ck.server.Call("KVServer.Get", &args, &reply)
+	for {
+		ok := ck.server.Call("KVServer.Get", &args, &reply)
+		if ok {
+			break
+		}
+	}
 	return reply.Value
 }
 
@@ -59,12 +64,14 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value}
+	ck.worder += 1
+	args := PutAppendArgs{Key: key, Value: value, Uid: ck.uid, WOrder: ck.worder}
 	reply := PutAppendReply{}
-	ok := ck.server.Call("KVServer."+op, &args, &reply)
-	if !ok {
-		// TODO send error handle
-		DPrintf("put append send error with %s %s\n", key, value)
+	for {
+		ok := ck.server.Call("KVServer."+op, &args, &reply)
+		if ok {
+			break
+		}
 	}
 	return reply.Value
 }
