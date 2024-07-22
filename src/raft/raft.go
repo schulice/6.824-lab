@@ -108,7 +108,8 @@ func (st *state) toString() string {
 }
 
 const (
-	HEARTBEAT_INTER = time.Duration(1000/10) * time.Millisecond
+	HEARTBEAT_INTER   = 100 * time.Millisecond
+	COMMIT_SEND_INTER = 75 * time.Millisecond
 )
 
 // return currentTerm and whether this server
@@ -531,71 +532,81 @@ func (rf *Raft) heartbeater(leaderTerm int) {
 }
 
 func (rf *Raft) commitHandler(leaderTerm int, server int) {
+	DPrintf("COMM\t%d\t%d\tinit", rf.me, server)
+	args := func() (ret AppendEntriesArgs) {
+		ret.Term = rf.currentTerm
+		ret.LeaderId = rf.me
+		ret.LeaderCommit = rf.commitIndex
+		ret.PrevLogIndex = rf.nextIndex[server] - 1
+		ret.PrevLogTerm = rf.log[ret.PrevLogIndex].Term
+		ret.Entries = rf.log[rf.nextIndex[server]:len(rf.log)] // [) when same
+		return
+	}()
+	reply := AppendEntriesReply{}
+	commitedIdx := len(rf.log) - 1
+	currentNextIdx := rf.nextIndex[server]
+	DPrintf("COMM\t%d\t%d", rf.me, server)
+	rf.mu.Unlock()
+
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if !ok {
+		DPrintf("COMM\t%d\t%d\tfail send", rf.me, server)
+		return
+	}
+
+	rf.mu.Lock()
+	// leader restrain check
+	if rf.currentTerm != leaderTerm || rf.currentState != stateLeader {
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Term > rf.currentTerm {
+		rf.currentState = stateFollower
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		DPrintf("STAT\tFollower\t%d\t%dCOMM", rf.me, rf.currentTerm)
+		rf.mu.Unlock()
+		return
+	}
+	// is commited by some thread
+	if currentNextIdx != rf.nextIndex[server] {
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Success {
+		rf.nextIndex[server] = commitedIdx + 1
+		rf.matchIndex[server] = commitedIdx
+		DPrintf("COMM\t%d\t%d\tsucceed", rf.me, server)
+		rf.mu.Unlock()
+		return
+	} else {
+		DPrintf("COMM\t%d\t%d\tdecrease", rf.me, server)
+		rf.nextIndex[server] -= 1
+		if rf.nextIndex[server] == 0 {
+			DPrintf("COMM\t%d\t%d\tERROR negtive nexidx", rf.me, server)
+		}
+		go rf.commitHandler(leaderTerm, server)
+	}
+}
+
+func (rf *Raft) commitProducer(leaderTerm int, server int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		DPrintf("COMM\t%d\t%d\tinit", rf.me, server)
-		if rf.currentTerm != leaderTerm || rf.currentState != stateLeader {
+		if rf.currentState != stateLeader || rf.currentTerm != leaderTerm {
 			rf.mu.Unlock()
 			return
 		}
-		for !(len(rf.log)-1 >= rf.nextIndex[server]) {
-			// wating here
+		for !(len(rf.log) >= rf.nextIndex[server]) {
 			rf.commitCond.Wait()
-			if rf.currentTerm != leaderTerm || rf.currentState != stateLeader {
+			if rf.currentState != stateLeader || rf.currentTerm != leaderTerm {
 				rf.mu.Unlock()
 				return
 			}
 		}
-		args := func() (ret AppendEntriesArgs) {
-			ret.Term = rf.currentTerm
-			ret.LeaderId = rf.me
-			ret.LeaderCommit = rf.commitIndex
-			ret.PrevLogIndex = rf.nextIndex[server] - 1
-			ret.PrevLogTerm = rf.log[ret.PrevLogIndex].Term
-			ret.Entries = rf.log[rf.nextIndex[server]:len(rf.log)] // [) when same
-			return
-		}()
-		reply := AppendEntriesReply{}
-		commitedIdx := len(rf.log) - 1
-		DPrintf("COMM\t%d\t%d", rf.me, server)
-		rf.mu.Unlock()
 
-		ok := rf.sendAppendEntries(server, &args, &reply)
-		if !ok {
-			DPrintf("COMM\t%d\t%d\tfail send", rf.me, server)
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
+		go rf.commitHandler(leaderTerm, server)
 
-		rf.mu.Lock()
-		if rf.currentTerm != leaderTerm || rf.currentState != stateLeader {
-			rf.mu.Unlock()
-			return
-		}
-		if !(len(rf.log)-1 >= rf.nextIndex[server]) {
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Term > rf.currentTerm {
-			rf.currentState = stateFollower
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			DPrintf("STAT\tFollower\t%d\t%dCOMM", rf.me, rf.currentTerm)
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Success {
-			rf.nextIndex[server] = commitedIdx + 1
-			rf.matchIndex[server] = commitedIdx
-			DPrintf("COMM\t%d\t%d\tsucceed", rf.me, server)
-		} else {
-			DPrintf("COMM\t%d\t%d\tdecrease", rf.me, server)
-			rf.nextIndex[server] -= 1
-			if rf.nextIndex[server] == 0 {
-				DPrintf("COMM\t%d\t%d\tERROR negtive nexidx", rf.me, server)
-			}
-		}
-		rf.mu.Unlock()
+		time.Sleep(COMMIT_SEND_INTER)
 	}
 }
 
@@ -650,7 +661,7 @@ func (rf *Raft) leader() {
 
 	peerNum := len(rf.peers)
 	for i := (rf.me + 1) % peerNum; i != rf.me; i = (i + 1) % peerNum {
-		go rf.commitHandler(leaderTerm, i)
+		go rf.commitProducer(leaderTerm, i)
 	}
 
 	go rf.commitUpdater(leaderTerm)
@@ -698,8 +709,6 @@ func (rf *Raft) applyer() {
 			rf.applyCh <- msg
 		}
 		DPrintf("APPL\t%d\t[%d, %d)", rf.me, bufferHead, bufferHead+len(buffer))
-		rf.applyCond.Broadcast()
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
