@@ -215,11 +215,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	DPrintf("AE\t%d", rf.me)
 	rf.lastHearbeat = time.Now()
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.XTerm = 0
+	reply.XIndex = args.PrevLogIndex - 1
+	reply.XLen = len(rf.log)
 
 	// all server rule
 	if args.Term > rf.currentTerm {
@@ -241,6 +245,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		// binary search to find oooxxxxx(y)yyyy
+		reply.XIndex = func() int {
+			l := 0
+			r := args.PrevLogIndex
+			for l < r {
+				mid := (l + r) / 2
+				if rf.log[mid].Term == reply.XTerm {
+					r = mid
+				} else {
+					l = mid + 1
+				}
+			}
+			return l
+		}()
 		return
 	}
 
@@ -568,17 +587,17 @@ func (rf *Raft) commitHandler(leaderTerm int, server int) {
 		rf.mu.Unlock()
 		return
 	}
+	// is commited by other thread
+	if currentNextIdx != rf.nextIndex[server] {
+		rf.mu.Unlock()
+		return
+	}
 	// all server
 	if reply.Term > rf.currentTerm {
 		rf.currentState = stateFollower
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		DPrintf("STAT\tFollower\t%d\t%dCOMM", rf.me, rf.currentTerm)
-		rf.mu.Unlock()
-		return
-	}
-	// is commited by some thread
-	if currentNextIdx != rf.nextIndex[server] {
 		rf.mu.Unlock()
 		return
 	}
@@ -590,7 +609,36 @@ func (rf *Raft) commitHandler(leaderTerm int, server int) {
 		return
 	} else {
 		DPrintf("COMM\t%d\t%d\tdecrease", rf.me, server)
-		rf.nextIndex[server] -= 1
+		if len(rf.log) > 4*reply.XLen {
+			// CASE leader.log.len >> XLen
+			rf.nextIndex[server] = reply.XLen
+		} else if reply.XTerm == 0 {
+			// CASE default, prevIdx not in follower log
+			rf.nextIndex[server] -= 1
+		} else {
+			// binsearch to find oooyyyxx(x)zzz
+			lastXIndex := func() int {
+				l := 0
+				r := len(rf.log) - 1
+				for l < r {
+					mid := (l + r + 1) / 2
+					if rf.log[mid].Term <= reply.XTerm {
+						l = mid
+					} else {
+						r = mid - 1
+					}
+				}
+				return l
+			}()
+			if rf.log[lastXIndex].Term != reply.XTerm {
+				// CASE leader does not have xterm
+				rf.nextIndex[server] = reply.XIndex
+			} else {
+				// CASE leader has xterm
+				rf.nextIndex[server] = lastXIndex
+			}
+		}
+
 		if rf.nextIndex[server] == 0 {
 			DPrintf("COMM\t%d\t%d\tERROR negtive nexidx", rf.me, server)
 		}
