@@ -107,6 +107,14 @@ func (st *state) toString() string {
 	return "N"
 }
 
+// go1.15 no min
+func min(a int, b int) int {
+	if a > b {
+		return b
+	}
+	return a
+}
+
 const (
 	HEARTBEAT_INTER   = 100 * time.Millisecond
 	COMMIT_SEND_INTER = 75 * time.Millisecond
@@ -193,6 +201,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -225,7 +236,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	prevIdxInside := args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log)
-	if !prevIdxInside || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if !prevIdxInside {
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 
@@ -244,13 +259,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
-		// min(lastNewIdx, leardercommit)
 		lastNewIdx := args.PrevLogIndex + len(args.Entries)
-		if args.LeaderCommit > lastNewIdx {
-			rf.commitIndex = lastNewIdx
-		} else {
-			rf.commitIndex = args.LeaderCommit
-		}
+		rf.commitIndex = min(args.LeaderCommit, lastNewIdx)
 		rf.applyCond.Broadcast()
 	}
 
@@ -446,7 +456,6 @@ func (rf *Raft) candidate() {
 	}
 	sendRV := func(server int) {
 		reply := RequestVoteReply{}
-
 		ok := rf.sendRequestVote(server, &args, &reply)
 		if !ok {
 			DPrintf("VOTE\t%d\t%d\tfail sent", rf.me, server)
@@ -474,7 +483,6 @@ func (rf *Raft) candidate() {
 			}
 		}
 		rf.mu.Unlock()
-		return
 	}
 
 	for i := (rf.me + 1) % peerNum; i != rf.me; i = (i + 1) % peerNum {
@@ -533,21 +541,21 @@ func (rf *Raft) heartbeater(leaderTerm int) {
 
 func (rf *Raft) commitHandler(leaderTerm int, server int) {
 	DPrintf("COMM\t%d\t%d\tinit", rf.me, server)
+	currentNextIdx := rf.nextIndex[server]
+	commitedIdx := min(len(rf.log)-1, currentNextIdx+10)
 	args := func() (ret AppendEntriesArgs) {
 		ret.Term = rf.currentTerm
 		ret.LeaderId = rf.me
 		ret.LeaderCommit = rf.commitIndex
-		ret.PrevLogIndex = rf.nextIndex[server] - 1
+		ret.PrevLogIndex = currentNextIdx - 1
 		ret.PrevLogTerm = rf.log[ret.PrevLogIndex].Term
-		ret.Entries = rf.log[rf.nextIndex[server]:len(rf.log)] // [) when same
+		ret.Entries = rf.log[currentNextIdx : commitedIdx+1] // [) when same
 		return
 	}()
-	reply := AppendEntriesReply{}
-	commitedIdx := len(rf.log) - 1
-	currentNextIdx := rf.nextIndex[server]
 	DPrintf("COMM\t%d\t%d", rf.me, server)
 	rf.mu.Unlock()
 
+	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, &args, &reply)
 	if !ok {
 		DPrintf("COMM\t%d\t%d\tfail send", rf.me, server)
@@ -560,6 +568,7 @@ func (rf *Raft) commitHandler(leaderTerm int, server int) {
 		rf.mu.Unlock()
 		return
 	}
+	// all server
 	if reply.Term > rf.currentTerm {
 		rf.currentState = stateFollower
 		rf.currentTerm = reply.Term
@@ -592,6 +601,7 @@ func (rf *Raft) commitHandler(leaderTerm int, server int) {
 func (rf *Raft) commitProducer(leaderTerm int, server int) {
 	for !rf.killed() {
 		rf.mu.Lock()
+		// state checker
 		if rf.currentState != stateLeader || rf.currentTerm != leaderTerm {
 			rf.mu.Unlock()
 			return
@@ -603,7 +613,6 @@ func (rf *Raft) commitProducer(leaderTerm int, server int) {
 				return
 			}
 		}
-
 		go rf.commitHandler(leaderTerm, server)
 
 		time.Sleep(COMMIT_SEND_INTER)
