@@ -497,10 +497,16 @@ func (rf *Raft) killed() bool {
 }
 
 // MUST mu.lock() to enter
+// To follower
 func (rf *Raft) meetLargerTerm(term int) {
+	// exit leader
+	rf.nextIndex = nil
+	rf.matchIndex = nil
+
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.currentState = stateFollower
+
 	rf.persist()
 	DPrintf("STAT\tFollower\tP%d\tT%d", rf.me, rf.currentTerm)
 }
