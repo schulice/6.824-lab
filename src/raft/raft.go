@@ -649,16 +649,18 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 		rf.mu.Unlock()
 		return
 	} else {
-		if len(rf.log) > 4*reply.XLen {
-			// CASE leader.log.len >> XLen
-			rf.nextIndex[server] = reply.XLen
+		if rf.nextIndex[server] > 4*reply.XLen {
+			// CASE XLen too short
+			rf.nextIndex[server] = reply.XLen + 1 // refuse 0 XLen
+			DPrintf("COMM\t%d\t%d\tchange\t%d to %d CASE llen >> len with %v", rf.me, server, currentNextIdx, rf.nextIndex[server], rf.log)
 		} else if reply.XTerm == 0 {
-			// CASE default, prevIdx not in follower log
+			// CASE default, prevIdx not in follower's log
 			rf.nextIndex[server] -= 1
+			DPrintf("COMM\t%d\t%d\tchange\t%d to %d CASE default with %v", rf.me, server, currentNextIdx, rf.nextIndex[server], rf.log)
 		} else {
 			// binsearch to find oooyyyxx(x)zzz
 			lastXIndex := func() int {
-				l := 0
+				l := 0 // cannot set 1 due to 0 len
 				r := len(rf.log) - 1
 				for l < r {
 					mid := (l + r + 1) / 2
@@ -673,13 +675,13 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 			if rf.log[lastXIndex].Term != reply.XTerm {
 				// CASE leader does not have xterm
 				rf.nextIndex[server] = reply.XIndex
+				DPrintf("COMM\t%d\t%d\tchange\t%d to %d CASE do not XTerm with %v", rf.me, server, currentNextIdx, rf.nextIndex[server], rf.log)
 			} else {
 				// CASE leader has xterm
 				rf.nextIndex[server] = lastXIndex
+				DPrintf("COMM\t%d\t%d\tchange\t%d to %d CASE XTerm with %v", rf.me, server, currentNextIdx, rf.nextIndex[server], rf.log)
 			}
 		}
-
-		DPrintf("COMM\t%d\t%d\tchange\t%d to %d", rf.me, server, currentNextIdx, rf.nextIndex[server])
 
 		// continue when not succeed
 		go rf.appendHandle(leaderTerm, server)
