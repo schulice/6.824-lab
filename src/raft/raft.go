@@ -299,9 +299,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// need lock to prevent random applymsg
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      rf.currentSnapshot,
-		SnapshotIndex: rf.lastIncludedIndex,
-		SnapshotTerm:  rf.log[0].Term,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  args.LastIncludedTerm,
 	}
 
 }
@@ -776,7 +776,9 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 	currentLastIdx := rf.toAbsIndex(len(rf.log) - 1)
 	args := func() (ret AppendEntriesArgs) {
 		ret = rf.makeEmptyAppendEntriesArgs(server)
-		ret.Entries = rf.log[rf.toLogIndex(currentNextIdx) : rf.toLogIndex(currentLastIdx)+1] // [) when same
+		// MUST copy, due to the race from RPC to change error log
+		ret.Entries = make([]entry, currentLastIdx+1-currentNextIdx)
+		copy(ret.Entries, rf.log[rf.toLogIndex(currentNextIdx):rf.toLogIndex(currentLastIdx)+1]) // [) when same
 		return
 	}()
 	DPrintf("COMM\t%d\t%d", rf.me, server)
@@ -993,7 +995,8 @@ func (rf *Raft) applier() {
 			rf.applyCond.Wait()
 		}
 		bufferHead := rf.lastApplied + 1
-		buffer := rf.log[rf.toLogIndex(bufferHead):rf.toLogIndex(rf.commitIndex+1)] //[head, commit]
+		buffer := make([]entry, rf.commitIndex+1-bufferHead)
+		copy(buffer, rf.log[rf.toLogIndex(bufferHead):rf.toLogIndex(rf.commitIndex+1)]) //[head, commit]
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
 
