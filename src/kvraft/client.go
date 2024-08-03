@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"time"
 
 	"6.5840/labrpc"
 )
@@ -14,6 +15,10 @@ type Clerk struct {
 	cid      int64
 	windex   int64
 }
+
+const (
+	ELECTION_TIMEOUT = 1000 * time.Millisecond
+)
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
@@ -51,24 +56,26 @@ func (ck *Clerk) Get(key string) string {
 	}
 	reply := GetReply{}
 
+	sidc := ck.leaderId
 	for {
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
 		DPrintf("CLIE\tGet\targs:%v", args)
 		if !ok {
 			DPrintf("CLIE\tGet\tsid:%d\tTimeout", ck.leaderId)
-			ck.updateLeader()
+			ck.updateLeader(sidc)
 			continue
 		}
 		switch reply.Err {
 		case ErrWrongLeader:
 			DPrintf("CLIE\tGet\tWrongLeader")
-			ck.updateLeader()
+			ck.updateLeader(sidc)
 			continue
 		case ErrNoKey:
 			return ""
 		case OK:
 			return reply.Value
 		}
+		time.Sleep(ELECTION_TIMEOUT / 10)
 	}
 }
 
@@ -95,23 +102,26 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 	reply := PutAppendReply{}
 
+	sidc := ck.leaderId
 	for {
 		ok := ck.servers[ck.leaderId].Call("KVServer."+op, &args, &reply)
 		DPrintf("CLIE\t%s\targs:%v", op, args)
 		if !ok {
 			DPrintf("CLIE\tPUT\tsid:%d\tTimeout", ck.leaderId)
-			ck.updateLeader()
+			ck.updateLeader(sidc)
 			continue
 		}
 		switch reply.Err {
 		case ErrWrongLeader:
 			DPrintf("CLIE\tPut\tWrongLeader")
-			ck.updateLeader()
+			ck.updateLeader(sidc)
+			continue
 		case ErrNoKey:
 			DPrintf("CLIE\tPut\tNoKey")
 		case OK:
 			return
 		}
+		time.Sleep(ELECTION_TIMEOUT / 10)
 	}
 }
 
@@ -122,6 +132,9 @@ func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
 
-func (ck *Clerk) updateLeader() {
+func (ck *Clerk) updateLeader(sidc int) {
 	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+	if ck.leaderId == sidc {
+		time.Sleep(ELECTION_TIMEOUT)
+	}
 }

@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -74,9 +75,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	// persist
-	state map[string]string
+	state       map[string]string
+	clerkWIndex map[int64]int64
 
-	// leader state
+	// leader state(Only Debug)
 	isLeader bool
 
 	// apply
@@ -84,7 +86,9 @@ type KVServer struct {
 	appliedIndex    int
 	lastAppliedTime time.Time
 	commitInfo      map[int]clerkInfo
-	clerkWIndex     map[int64]int64
+
+	// snapshot
+	currentRaftState int
 }
 
 // MUST mu.Lock()
@@ -241,7 +245,7 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) applyHandle() {
+func (kv *KVServer) applyHandler() {
 	for {
 		msg := <-kv.applyCh
 		// DPrintf("APPL\tmsg:%v", msg)
@@ -249,7 +253,8 @@ func (kv *KVServer) applyHandle() {
 			kv.mu.Lock()
 			go kv.commandHandle(msg.CommandIndex, msg.Command.(Op))
 		} else if msg.SnapshotValid {
-
+			kv.mu.Lock()
+			go kv.installSnapshotHandle(msg.SnapshotIndex, msg.SnapshotTerm, msg.Snapshot)
 		}
 
 	}
@@ -271,10 +276,14 @@ func (kv *KVServer) commandHandle(index int, op Op) {
 
 	// ACCEPT op index, all return goto EXIT
 
+	// not as same as Nop committer
 	if op.Info.CId != 0 {
 		if ok := kv.windexChecker(op.Info.CId, op.Info.WIndex); !ok {
 			DPrintf("APPL\tErrorWIndex\tTarget:%d\tCurrent:%d", op.Info.WIndex, kv.clerkWIndex[op.Info.CId])
-			goto EXIT
+			// no side effect to repeatly command
+			op.Command = commandNop
+		} else {
+			kv.clerkWIndex[op.Info.CId] = op.Info.WIndex
 		}
 	}
 
@@ -293,17 +302,24 @@ func (kv *KVServer) commandHandle(index int, op Op) {
 		kv.state[op.Key] = op.Value
 	case commandAppend:
 		kv.state[op.Key] += op.Value
+	default:
+		DPrintf("APPL\tUNKNOWN_COMMAND:%d", op.Command)
 	}
-	kv.clerkWIndex[op.Info.CId] = op.Info.WIndex
 
-EXIT:
 	kv.appliedIndex = index
 	DPrintf("SERVER\tClerkWIndex:%v", kv.clerkWIndex)
+	if kv.maxraftstate != -1 {
+		kv.currentRaftState += 1
+		if kv.currentRaftState >= kv.maxraftstate*4/3 {
+			kv.currentRaftState = 0
+			kv.snapshotHandle()
+		}
+	}
 	kv.lastAppliedTime = time.Now()
 	kv.appliedCond.Broadcast()
 }
 
-func (kv *KVServer) applyTimeoutHandler() {
+func (kv *KVServer) applyTimeoutChecker() {
 	for !kv.killed() {
 		kv.mu.Lock()
 		if !time.Now().After(kv.lastAppliedTime.Add(APPLY_TIMEOUT)) {
@@ -327,8 +343,39 @@ func (kv *KVServer) applyTimeoutHandler() {
 		}
 		kv.mu.Unlock()
 		DPrintf("APPL\tTIMOUT\tfinish")
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(APPLY_TIMEOUT)
 	}
+}
+
+// mu.Lock()
+// Do not release Mutex
+func (kv *KVServer) snapshotHandle() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.state)
+	e.Encode(kv.clerkWIndex)
+	kvState := w.Bytes()
+	kv.rf.Snapshot(kv.appliedIndex, kvState)
+}
+
+// mu.Lock()
+func (kv *KVServer) installSnapshotHandle(index int, term int, kvState []byte) {
+	defer kv.mu.Unlock()
+	if kv.appliedIndex >= index {
+		return
+	}
+	r := bytes.NewBuffer(kvState)
+	d := labgob.NewDecoder(r)
+	var state map[string]string
+	var clerkwindex map[int64]int64
+	if d.Decode(&state) != nil ||
+		d.Decode(&clerkwindex) != nil {
+		DPrintf("SNAP\terrorSnapshot\tindex:%dterm:%d", index, term)
+		return
+	}
+	kv.state = state
+	kv.clerkWIndex = clerkwindex
+	kv.appliedCond.Broadcast()
 }
 
 // servers[] contains the ports of the set of
@@ -365,8 +412,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clerkWIndex = make(map[int64]int64)
 
 	kv.lastAppliedTime = time.Now()
-	go kv.applyHandle()
-	go kv.applyTimeoutHandler()
+	go kv.applyHandler()
+	go kv.applyTimeoutChecker()
 
 	return kv
 }
