@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -230,15 +231,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.lastApplied < index {
-		DPrintf("SNAP\tlargerIndex\t%d\t%d", rf.lastApplied, index)
+	if rf.commitIndex < index {
+		fmt.Printf("SNAP\tERROR\tlarger Index")
 	}
-
 	if index <= rf.lastIncludedIndex {
 		DPrintf("SNAP\tOutdate Index\t%d\t%d", rf.lastIncludedIndex, index)
 		return
 	}
 
+	if rf.lastApplied < index {
+		rf.lastApplied = index
+	}
 	rf.currentSnapshot = clone(snapshot)
 	rf.log = append(make([]entry, 0), rf.log[rf.toLogIndex(index):]...)
 	rf.log[0].Command = nil
@@ -289,21 +292,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
-	if rf.commitIndex < args.LastIncludedIndex {
-		rf.commitIndex = args.LastIncludedIndex
-	}
 	rf.currentSnapshot = args.Data
-	rf.persist()
-
-	// need lock to prevent random applymsg
-	rf.applyCh <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotIndex: args.LastIncludedIndex,
-		SnapshotTerm:  args.LastIncludedTerm,
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+		rf.commitIndex = args.LastIncludedIndex
+		// need lock to prevent random applymsg
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotIndex: args.LastIncludedIndex,
+			SnapshotTerm:  args.LastIncludedTerm,
+		}
 	}
-
+	rf.persist()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -433,8 +434,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewIdx := args.PrevLogIndex + len(args.Entries)
-		rf.commitIndex = min(args.LeaderCommit, lastNewIdx)
-		rf.applyCond.Broadcast()
+		// Snapshot
+		if lastNewIdx > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, lastNewIdx)
+			rf.applyCond.Broadcast()
+		}
 	}
 	reply.Success = true
 }
@@ -995,9 +999,9 @@ func (rf *Raft) applier() {
 			rf.applyCond.Wait()
 		}
 		bufferHead := rf.lastApplied + 1
-		buffer := make([]entry, rf.commitIndex+1-bufferHead)
-		copy(buffer, rf.log[rf.toLogIndex(bufferHead):rf.toLogIndex(rf.commitIndex+1)]) //[head, commit]
-		rf.lastApplied = rf.commitIndex
+		newLastApplied := rf.commitIndex
+		buffer := make([]entry, newLastApplied+1-bufferHead)
+		copy(buffer, rf.log[rf.toLogIndex(bufferHead):rf.toLogIndex(newLastApplied+1)]) //[head, commit]
 		rf.mu.Unlock()
 
 		for i := range buffer {
@@ -1008,7 +1012,13 @@ func (rf *Raft) applier() {
 			}
 			rf.applyCh <- msg
 		}
+
+		rf.mu.Lock()
+		if rf.lastApplied < newLastApplied {
+			rf.lastApplied = newLastApplied
+		}
 		DPrintf("APPL\t%d\t[%d, %d)\t%v", rf.me, bufferHead, bufferHead+len(buffer), buffer)
+		rf.mu.Unlock()
 	}
 }
 
