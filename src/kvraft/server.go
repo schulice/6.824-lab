@@ -102,7 +102,7 @@ func (kv *KVServer) windexChecker(cid int64, windex int64) bool {
 
 // MUST mu.Lock()
 func (kv *KVServer) rpcCommiter(op *Op) Err {
-	for {
+	for !kv.killed() {
 		var index int
 		index, _, kv.isLeader = kv.rf.Start(*op)
 		if !kv.isLeader {
@@ -122,11 +122,11 @@ func (kv *KVServer) rpcCommiter(op *Op) Err {
 
 		if kv.appliedIndex >= index &&
 			kv.clerkWIndex[op.Info.CId] >= op.Info.WIndex {
-			break
+			DPrintf("RPC\tStopWait")
+			return Err(OK)
 		}
 	}
-	DPrintf("RPC\tStopWait")
-	return Err(OK)
+	return Err(ErrWrongLeader)
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -242,7 +242,7 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) applyHandler() {
-	for {
+	for !kv.killed() {
 		msg := <-kv.applyCh
 		// DPrintf("APPL\tmsg:%v", msg)
 		if msg.CommandValid {
