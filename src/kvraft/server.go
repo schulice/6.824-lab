@@ -112,7 +112,7 @@ func (kv *KVServer) rpcCommiter(op *Op) Err {
 
 		DPrintf("%v\tsid:%d\tindex:%d\t%v", op.Command, kv.me, index, op.Info)
 
-		for !(kv.appliedIndex >= index || kv.commitInfo[index] != op.Info) {
+		for !(kv.commitInfo[index] != op.Info) {
 			kv.appliedCond.Wait()
 		}
 
