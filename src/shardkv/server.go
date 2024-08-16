@@ -1,18 +1,53 @@
 package shardkv
 
+import (
+	"sync"
+	"time"
 
-import "6.5840/labrpc"
-import "6.5840/raft"
-import "sync"
-import "6.5840/labgob"
-
-
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+	"6.5840/shardctrler"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Command command
+	Info    clerkInfo
+	Param   interface{}
 }
+
+type command uint8
+
+const (
+	commandNop = iota
+	commandGet
+	commandPut
+	commandAppend
+	commandConfigUpdate
+	commandShardRecieve
+	commandShardSuccess
+)
+
+type clerkInfo struct {
+	Shard int
+	Cid   int64
+	Index int64
+}
+
+type paramGet struct {
+	Key string
+}
+
+type paramPutAppend struct {
+	Key   string
+	Value string
+}
+
+type paramPut = paramPutAppend
+type paramAppend = paramPutAppend
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -25,15 +60,231 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+
+	// persist
+	appliedIndex  int
+	kvstate       []map[string]string
+	sci           []map[int64]int64 // (shard, cid) -> index
+	shardcnum     []int
+	currentConfig shardctrler.Config
+	rpcreply      []map[int64]string // (shard, cid) -> current read value
+
+	// helper
+
+	// apply
+	appliedCond     sync.Cond
+	lastAppliedTime time.Time
+	committedInfo   map[int]clerkInfo
+
+	// shard
+	mck shardctrler.Clerk
 }
 
+func (kv *ShardKV) isShardValid(shard int) bool {
+	if kv.currentConfig.Shards[shard] != kv.gid ||
+		kv.shardcnum[shard] != kv.currentConfig.Num {
+		return false
+	}
+	return true
+}
+
+func (kv *ShardKV) isNextIndex(shard int, cid int64, index int64) bool {
+	if _, ok := kv.sci[shard][cid]; !ok {
+		kv.sci[shard][cid] = 0
+	}
+	if index != kv.sci[shard][cid]+1 {
+		return false
+	}
+	delete(kv.rpcreply[shard], cid)
+	return true
+}
+
+func (kv *ShardKV) commitRPC(op *Op) Err {
+	for {
+		aindex, _, isLeader := kv.rf.Start(*op)
+		if !isLeader {
+			return ErrWrongLeader
+		}
+		kv.committedInfo[aindex] = op.Info
+
+		for !(kv.committedInfo[aindex] != op.Info) {
+			kv.appliedCond.Wait()
+		}
+
+		if kv.isShardValid(op.Info.Shard) {
+			return ErrWrongGroup
+		}
+		if op.Info.Index <= kv.sci[op.Info.Shard][op.Info.Cid] {
+			return OK
+		}
+		if op.Info.Index > kv.sci[op.Info.Shard][op.Info.Cid] {
+			// something not linearizable happened
+		}
+	}
+	return ErrWrongLeader
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if !kv.isShardValid(int(args.Shard)) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	if !kv.isNextIndex(int(args.Shard), args.Cid, args.Index) {
+		if kv.sci[args.Shard][args.Cid] == args.Index {
+			reply.Err = OK
+			var ok bool
+			reply.Value, ok = kv.rpcreply[args.Shard][args.Index]
+			if !ok {
+				reply.Value = ""
+			}
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		return
+	}
+
+	clerkinfo := &clerkInfo{
+		Shard: int(args.Shard),
+		Cid:   args.Cid,
+		Index: args.Index,
+	}
+	op := Op{
+		Command: commandGet,
+		Info:    *clerkinfo,
+		Param: paramGet{
+			Key: args.Key,
+		},
+	}
+
+	reply.Err = kv.commitRPC(&op)
+
+	if reply.Err == OK {
+		var ok bool
+		reply.Value, ok = kv.rpcreply[args.Shard][args.Index]
+		if !ok {
+			reply.Value = ""
+		}
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if !kv.isShardValid(int(args.Shard)) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	if !kv.isNextIndex(int(args.Shard), args.Cid, args.Index) {
+		if kv.sci[args.Shard][args.Cid] == args.Index {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		return
+	}
+
+	clerkinfo := &clerkInfo{
+		Shard: int(args.Shard),
+		Cid:   args.Cid,
+		Index: args.Index,
+	}
+	op := Op{
+		Command: commandGet,
+		Info:    *clerkinfo,
+		Param: paramGet{
+			Key: args.Key,
+		},
+	}
+
+	reply.Err = kv.commitRPC(&op)
+
+	// not need to read reply
+}
+
+func (kv *ShardKV) appliedChHandler() {
+	for {
+		msg := <-kv.applyCh
+		if msg.CommandValid {
+
+		} else if msg.SnapshotValid {
+
+		}
+	}
+}
+
+const _APPLY_TIMEOUT = 1000 * time.Millisecond
+
+func (kv *ShardKV) applyTimeoutChecker() {
+	for {
+		kv.mu.Lock()
+		if !time.Now().After(kv.lastAppliedTime.Add(_APPLY_TIMEOUT)) {
+			kv.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		nop := Op{
+			Command: commandNop,
+			Info:    clerkInfo{0, 0, 0},
+			Param:   nil,
+		}
+		kv.rf.Start(nop)
+		kv.mu.Unlock()
+		time.Sleep(_APPLY_TIMEOUT)
+	}
+
+}
+
+func (kv *ShardKV) commandHandle(index int, op *Op) {
+	defer kv.mu.Unlock()
+
+	if index != kv.appliedIndex+1 {
+		return
+	}
+	kv.appliedIndex = index
+	kv.lastAppliedTime = time.Now()
+	if v, ok := kv.committedInfo[index]; ok && v != op.Info {
+		kv.committedInfo = make(map[int]clerkInfo)
+	} else {
+		delete(kv.committedInfo, index)
+	}
+	// not from server self, need update clerk index table
+	if op.Info.Cid != 0 {
+		if !kv.isShardValid(op.Info.Shard) ||
+			!kv.isNextIndex(op.Info.Shard, op.Info.Cid, op.Info.Index) {
+			// in this case command is invalid
+			// not need to increase index and should no side effect
+			op.Command = commandNop
+		} else {
+			kv.sci[op.Info.Shard][op.Info.Cid] = op.Info.Index
+		}
+	}
+
+	// TODO
+	switch op.Command {
+	case commandNop:
+		// do nothing
+
+	// Clerk Op (lazy to put them in a single function)
+	case commandGet:
+		kv.rpcreply[op.Info.Shard][op.Info.Cid] = kv.kvstate[op.Info.Shard][op.Param.(paramGet).Key]
+	case commandPut:
+		kv.kvstate[op.Info.Shard][op.Param.(paramPut).Key] = op.Param.(paramPut).Value
+	case commandAppend:
+		kv.kvstate[op.Info.Shard][op.Param.(paramAppend).Key] += op.Param.(paramAppend).Value
+
+	// Peer Op
+	case commandConfigUpdate:
+	case commandShardRecieve:
+	case commandShardSuccess:
+
+	}
+
+	kv.appliedCond.Broadcast()
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -44,7 +295,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 // servers[] contains the ports of the servers in this group.
 //
@@ -85,13 +335,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.mck = *shardctrler.MakeClerk(kv.ctrlers)
+	// should not query config on making
 
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
 
 	return kv
 }

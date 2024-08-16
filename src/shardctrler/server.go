@@ -29,7 +29,7 @@ type ShardCtrler struct {
 }
 
 const (
-	APPLY_TIMEOUT = 1000 * time.Millisecond
+	_APPLY_TIMEOUT = 1000 * time.Millisecond
 )
 
 type clerkInfo struct {
@@ -82,22 +82,6 @@ func (sc *ShardCtrler) isNextCIndex(cid int64, windex int64) bool {
 	return true
 }
 
-// MUST mu.lock()
-// [currentneedindex+1 ..] will waiting
-func (sc *ShardCtrler) isCIndexFinished(cid int64, index int64) bool {
-	for {
-		ok := sc.isNextCIndex(cid, index)
-		if ok {
-			return false
-		}
-		if index <= sc.clerkIndex[cid] {
-			return true
-		}
-
-		sc.appliedCond.Wait()
-	}
-}
-
 // MUST mu.Lock()
 func (sc *ShardCtrler) commitRPC(op *Op) Err {
 	for {
@@ -107,11 +91,11 @@ func (sc *ShardCtrler) commitRPC(op *Op) Err {
 		}
 		sc.commitInfo[index] = op.Info
 
-		for !(sc.appliedIndex >= index || sc.commitInfo[index] != op.Info) {
+		for !(sc.commitInfo[index] != op.Info) {
 			sc.appliedCond.Wait()
 		}
 
-		if sc.appliedIndex >= index && sc.clerkIndex[op.Info.CID] >= op.Info.Index {
+		if sc.clerkIndex[op.Info.CID] >= op.Info.Index {
 			return Err(OK)
 		}
 	}
@@ -122,14 +106,15 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	reply.WrongLeader = true
-
-	if sc.isCIndexFinished(args.CID, args.Index) {
-		reply.WrongLeader = false
-		reply.Err = Err(OK)
+	if !sc.isNextCIndex(args.CID, args.Index) {
+		if sc.clerkIndex[args.CID] == args.Index {
+			reply.WrongLeader = false
+			reply.Err = OK
+		} else {
+			reply.WrongLeader = true
+		}
 		return
 	}
-
 	clerkinfo := clerkInfo{args.CID, args.Index}
 	op := Op{
 		Command: commandJoin,
@@ -153,9 +138,13 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 	reply.WrongLeader = true
 
-	if sc.isCIndexFinished(args.CID, args.Index) {
-		reply.WrongLeader = false
-		reply.Err = Err(OK)
+	if !sc.isNextCIndex(args.CID, args.Index) {
+		if sc.clerkIndex[args.CID] == args.Index {
+			reply.WrongLeader = false
+			reply.Err = OK
+		} else {
+			reply.WrongLeader = true
+		}
 		return
 	}
 
@@ -172,6 +161,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 	if reply.Err == Err("ErrWrongLeader") {
 		reply.WrongLeader = true
+		return
 	}
 }
 
@@ -182,9 +172,13 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 	reply.WrongLeader = true
 
-	if sc.isCIndexFinished(args.CID, args.Index) {
-		reply.WrongLeader = false
-		reply.Err = Err(OK)
+	if !sc.isNextCIndex(args.CID, args.Index) {
+		if sc.clerkIndex[args.CID] == args.Index {
+			reply.WrongLeader = false
+			reply.Err = OK
+		} else {
+			reply.WrongLeader = true
+		}
 		return
 	}
 
@@ -202,6 +196,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 	if reply.Err == Err("ErrWrongLeader") {
 		reply.WrongLeader = true
+		return
 	}
 }
 
@@ -210,12 +205,13 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	reply.WrongLeader = true
-
-	if sc.isCIndexFinished(args.CID, args.Index) {
-		reply.Config = *sc.query(paramQuery{Num: args.Num})
-		reply.WrongLeader = false
-		reply.Err = Err(OK)
+	if !sc.isNextCIndex(args.CID, args.Index) {
+		if sc.clerkIndex[args.CID] == args.Index {
+			reply.WrongLeader = false
+			reply.Err = OK
+		} else {
+			reply.WrongLeader = true
+		}
 		return
 	}
 
@@ -230,6 +226,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	if reply.Err == Err("ErrWrongLeader") {
 		reply.WrongLeader = true
+		return
 	}
 
 	reply.Config = *sc.query(paramQuery{Num: args.Num})
@@ -413,7 +410,7 @@ func (sc *ShardCtrler) commandHandle(index int, op Op) {
 func (sc *ShardCtrler) applyTimeoutChecker() {
 	for {
 		sc.mu.Lock()
-		if !time.Now().After(sc.lastAppliedTime.Add(APPLY_TIMEOUT)) {
+		if !time.Now().After(sc.lastAppliedTime.Add(_APPLY_TIMEOUT)) {
 			sc.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 			continue
@@ -430,7 +427,7 @@ func (sc *ShardCtrler) applyTimeoutChecker() {
 		sc.rf.Start(op)
 		sc.mu.Unlock()
 
-		time.Sleep(APPLY_TIMEOUT)
+		time.Sleep(_APPLY_TIMEOUT)
 	}
 }
 
