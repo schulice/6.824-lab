@@ -49,6 +49,10 @@ type paramPutAppend struct {
 type paramPut = paramPutAppend
 type paramAppend = paramPutAppend
 
+type paramConfigUpdate struct {
+	Config shardctrler.Config
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -66,8 +70,8 @@ type ShardKV struct {
 	kvstate       []map[string]string
 	sci           []map[int64]int64 // (shard, cid) -> index
 	shardcnum     []int
+	shardtarget   []int
 	currentConfig shardctrler.Config
-	rpcreply      []map[int64]string // (shard, cid) -> current read value
 
 	// helper
 
@@ -95,7 +99,6 @@ func (kv *ShardKV) isNextIndex(shard int, cid int64, index int64) bool {
 	if index != kv.sci[shard][cid]+1 {
 		return false
 	}
-	delete(kv.rpcreply[shard], cid)
 	return true
 }
 
@@ -135,11 +138,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if !kv.isNextIndex(int(args.Shard), args.Cid, args.Index) {
 		if kv.sci[args.Shard][args.Cid] == args.Index {
 			reply.Err = OK
-			var ok bool
-			reply.Value, ok = kv.rpcreply[args.Shard][args.Index]
-			if !ok {
-				reply.Value = ""
-			}
+			reply.Value = kv.kvstate[args.Shard][args.Key]
 		} else {
 			reply.Err = ErrWrongLeader
 		}
@@ -162,11 +161,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = kv.commitRPC(&op)
 
 	if reply.Err == OK {
-		var ok bool
-		reply.Value, ok = kv.rpcreply[args.Shard][args.Index]
-		if !ok {
-			reply.Value = ""
-		}
+		reply.Value = kv.kvstate[args.Shard][args.Key]
 	}
 }
 
@@ -205,11 +200,26 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// not need to read reply
 }
 
+func (kv *ShardKV) configUpdate(param *paramConfigUpdate) {
+	if param.Config.Num <= kv.currentConfig.Num {
+		return
+	}
+	for i, v := range param.Config.Shards {
+		if v == kv.currentConfig.Shards[i] {
+			kv.shardcnum[i] = param.Config.Num
+		} else if kv.shardtarget[i] == 0 {
+			kv.shardtarget[i] = v
+		}
+		// if kv.shardtarget i != 0, this shard is sent
+	}
+	kv.currentConfig = param.Config
+}
+
 func (kv *ShardKV) appliedChHandler() {
 	for {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
-
+			kv.commandHandle(msg.CommandIndex, msg.Command.(Op))
 		} else if msg.SnapshotValid {
 
 		}
@@ -239,7 +249,8 @@ func (kv *ShardKV) applyTimeoutChecker() {
 
 }
 
-func (kv *ShardKV) commandHandle(index int, op *Op) {
+func (kv *ShardKV) commandHandle(index int, op Op) {
+	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if index != kv.appliedIndex+1 {
@@ -271,7 +282,7 @@ func (kv *ShardKV) commandHandle(index int, op *Op) {
 
 	// Clerk Op (lazy to put them in a single function)
 	case commandGet:
-		kv.rpcreply[op.Info.Shard][op.Info.Cid] = kv.kvstate[op.Info.Shard][op.Param.(paramGet).Key]
+		// not need to do in this
 	case commandPut:
 		kv.kvstate[op.Info.Shard][op.Param.(paramPut).Key] = op.Param.(paramPut).Value
 	case commandAppend:
@@ -285,6 +296,26 @@ func (kv *ShardKV) commandHandle(index int, op *Op) {
 	}
 
 	kv.appliedCond.Broadcast()
+}
+
+func (kv *ShardKV) configUpdateDetector() {
+	for {
+		kv.mu.Lock()
+		nxt := kv.mck.Query(kv.currentConfig.Num + 1)
+		if nxt.Num != kv.currentConfig.Num+1 {
+			kv.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		op := Op{
+			Command: commandConfigUpdate,
+			Info:    clerkInfo{0, 0, 0},
+			Param:   nxt,
+		}
+		kv.rf.Start(op)
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // the tester calls Kill() when a ShardKV instance won't
