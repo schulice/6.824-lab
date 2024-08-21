@@ -154,25 +154,22 @@ func (kv *ShardKV) commitRPC(op *Op) Err {
 		if !isLeader {
 			return ErrWrongLeader
 		}
-		DPrintf("COMM\tstart\tgid:%d\tindex:%d\tinfo:%v", kv.gid, aindex, op.Info)
+		// DPrintf("COMM\tstart\tgid:%d\tindex:%d\top:%v", kv.gid, aindex, op)
 		kv.committedInfo[aindex] = op.Info
 
 		for !(kv.committedInfo[aindex] != op.Info) {
 			kv.appliedCond.Wait()
 		}
 
-		if op.Info.Shard != -1 &&
-			kv.isShardValid(op.Info.Shard) {
+		if kv.isShardValid(op.Info.Shard) {
 			return ErrWrongGroup
 		}
-		if op.Info.Cid != -1 &&
-			op.Info.Index <= kv.sci[op.Info.Shard][op.Info.Cid] {
-			DPrintf("COMM\tfinish\tgid:%d\tindex:%d\tinfo:%v", kv.gid, aindex, op.Info)
+		if op.Info.Index <= kv.sci[op.Info.Shard][op.Info.Cid] {
+			// DPrintf("COMM\tfinish\tgid:%d\tindex:%d\top:%v", kv.gid, aindex, op)
 			return OK
 		}
-		if op.Info.Cid != -1 &&
-			op.Info.Index > kv.sci[op.Info.Shard][op.Info.Cid] {
-			DPrintf("COMM\t---ERROR---\tnolinear\tgid:%d\tindex:%d\tinfo:%v", kv.gid, aindex, op.Info)
+		if op.Info.Index > kv.sci[op.Info.Shard][op.Info.Cid] {
+			DPrintf("COMM\t---ERROR---\tnolinear\tgid:%d\tindex:%d\top:%v", kv.gid, aindex, op)
 			// something not linearizable happened
 		}
 	}
@@ -285,7 +282,22 @@ func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply
 		},
 	}
 
-	reply.Err = kv.commitRPC(&op)
+	for !kv.killed() {
+		index, _, isleader := kv.rf.Start(op)
+		if !isleader {
+			reply.Err = ErrWrongLeader
+			break
+		}
+		kv.committedInfo[index] = op.Info
+		for kv.committedInfo[index] == op.Info {
+			kv.appliedCond.Wait()
+		}
+		if kv.shardcnum[op.Param.(paramShardRecieve).Shard] >= op.Param.(paramShardRecieve).CNum {
+			DPrintf("RPCS\tRecieve\tfinish\tgid:%d\tsid:%d\targs:%v", kv.gid, args.Shard, args)
+			reply.Err = OK
+			break
+		}
+	}
 }
 
 func (kv *ShardKV) configUpdate(param *paramConfigUpdate) {
@@ -293,11 +305,12 @@ func (kv *ShardKV) configUpdate(param *paramConfigUpdate) {
 		return
 	}
 	for s, g := range param.Config.Shards {
-		if g == param.Config.Shards[s] &&
-			kv.shardcnum[s]+1 == param.Config.Num {
-			kv.shardcnum[s] = param.Config.Num
-		} else if _, ok := kv.shardtarget[s]; !ok {
-			kv.shardtarget[s] = param.Config.Groups[g]
+		if kv.shardcnum[s]+1 == param.Config.Num {
+			if g == kv.gid {
+				kv.shardcnum[s] = param.Config.Num
+			} else if kv.shardcnum[s] != 0 {
+				kv.shardtarget[s] = param.Config.Groups[g]
+			}
 		}
 		// if kv.shardcnum is not linearable and kv.shardtarget i != 0, this shard is sent
 	}
@@ -310,16 +323,20 @@ func (kv *ShardKV) shardRecieve(param *paramShardRecieve) {
 		return
 	}
 
-	kv.kvstate[param.Shard] = param.KV
-	kv.sci[param.Shard] = param.ClerkIndex
+	kv.kvstate[param.Shard] = make(map[string]string)
+	for i := range param.KV {
+		kv.kvstate[param.Shard][i] = param.KV[i]
+	}
+	kv.sci[param.Shard] = make(map[int64]int64)
+	for i := range param.ClerkIndex {
+		kv.sci[param.Shard][i] = param.ClerkIndex[i]
+	}
 
 	if kv.currentConfig.Shards[param.Shard] == kv.gid {
 		kv.shardcnum[param.Shard] = kv.currentConfig.Num
 	} else {
 		kv.shardcnum[param.Shard] = kv.currentConfig.Num - 1
-		if _, ok := kv.shardtarget[param.Shard]; !ok {
-			kv.shardtarget[param.Shard] = kv.currentConfig.Groups[kv.currentConfig.Shards[param.Shard]]
-		}
+		kv.shardtarget[param.Shard] = kv.currentConfig.Groups[kv.currentConfig.Shards[param.Shard]]
 	}
 }
 
@@ -386,11 +403,19 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 		return
 	}
 	cnum := kv.shardcnum[s]
+	ci := make(map[int64]int64)
+	for i := range kv.sci[s] {
+		ci[i] = kv.sci[s][i]
+	}
+	kvs := make(map[string]string)
+	for i := range kv.kvstate[s] {
+		kvs[i] = kv.kvstate[s][i]
+	}
 	args := RecieveShardArgs{
 		CNum:       int64(cnum),
 		Shard:      int64(s),
-		ClerkIndex: kv.sci[s],
-		KV:         kv.kvstate[s],
+		ClerkIndex: ci,
+		KV:         kvs,
 	}
 	kv.mu.Unlock()
 
@@ -410,6 +435,10 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 
 	kv.mu.Lock()
 	if _, ok := kv.shardtarget[s]; !ok {
+		kv.mu.Unlock()
+		return
+	}
+	if kv.shardcnum[s] != cnum {
 		kv.mu.Unlock()
 		return
 	}
