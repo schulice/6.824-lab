@@ -3,6 +3,7 @@ package shardctrler
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.5840/labgob"
@@ -15,6 +16,7 @@ type ShardCtrler struct {
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
+	dead    int32
 
 	// Your data here.
 	configs []Config // indexed by config num
@@ -84,7 +86,7 @@ func (sc *ShardCtrler) isNextCIndex(cid int64, windex int64) bool {
 
 // MUST mu.Lock()
 func (sc *ShardCtrler) commitRPC(op *Op) Err {
-	for {
+	for !sc.killed() {
 		index, _, isLeader := sc.rf.Start(*op)
 		if !isLeader {
 			return Err("ErrWrongLeader")
@@ -99,6 +101,7 @@ func (sc *ShardCtrler) commitRPC(op *Op) Err {
 			return Err(OK)
 		}
 	}
+	return Err("ErrWrongLeader")
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
@@ -348,8 +351,14 @@ func (sc *ShardCtrler) query(param paramQuery) *Config {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (sc *ShardCtrler) Kill() {
+	atomic.StoreInt32(&sc.dead, 1)
 	sc.rf.Kill()
 	// Your code here, if desired.
+}
+
+func (sc *ShardCtrler) killed() bool {
+	z := atomic.LoadInt32(&sc.dead)
+	return z == 1
 }
 
 // needed by shardkv tester
@@ -358,17 +367,17 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 }
 
 func (sc *ShardCtrler) applyChHandler() {
-	for {
+	for !sc.killed() {
 		msg := <-sc.applyCh
 		if msg.CommandValid {
-			sc.mu.Lock()
-			go sc.commandHandle(msg.CommandIndex, msg.Command.(Op))
+			sc.commandHandle(msg.CommandIndex, msg.Command.(Op))
 		}
 	}
 }
 
 // handle lock
 func (sc *ShardCtrler) commandHandle(index int, op Op) {
+	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
 	if index != sc.appliedIndex+1 {
@@ -408,7 +417,7 @@ func (sc *ShardCtrler) commandHandle(index int, op Op) {
 }
 
 func (sc *ShardCtrler) applyTimeoutChecker() {
-	for {
+	for !sc.killed() {
 		sc.mu.Lock()
 		if !time.Now().After(sc.lastAppliedTime.Add(_APPLY_TIMEOUT)) {
 			sc.mu.Unlock()

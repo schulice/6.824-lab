@@ -48,3 +48,14 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type RecieveShardArgs struct {
+	CNum       int64
+	Shard      int64
+	ClerkIndex map[int64]int64
+	KV         map[string]string
+}
+
+type RecieveShardReply struct {
+	Err Err
+}

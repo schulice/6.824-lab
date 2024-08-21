@@ -57,7 +57,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
-	ck.cid = nrand()%int64((^uint64(0)>>1)-1) + 1
+	ck.cid = nrand()
 	ck.index = make([]int64, shardctrler.NShards)
 	return ck
 }
@@ -72,6 +72,7 @@ func (ck *Clerk) Get(key string) string {
 	shard := key2shard(key)
 	args.Cid = ck.cid
 	args.Shard = int64(shard)
+	ck.index[shard] += 1
 	args.Index = ck.index[shard]
 
 	for {
@@ -109,6 +110,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	shard := key2shard(key)
 	args.Cid = ck.cid
 	args.Shard = int64(shard)
+	ck.index[shard] += 1
 	args.Index = ck.index[shard]
 
 	for {
