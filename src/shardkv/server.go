@@ -13,7 +13,7 @@ import (
 	"6.5840/shardctrler"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -79,8 +79,10 @@ type paramPutAppend struct {
 	Value string
 }
 
-type paramPut = paramPutAppend
-type paramAppend = paramPutAppend
+type (
+	paramPut    = paramPutAppend
+	paramAppend = paramPutAppend
+)
 
 type paramConfigUpdate struct {
 	Config shardctrler.Config
@@ -131,11 +133,11 @@ type ShardKV struct {
 }
 
 func (kv *ShardKV) isShardValid(shard int) bool {
-	if kv.currentConfig.Shards[shard] != kv.gid ||
-		kv.shardcnum[shard] != kv.currentConfig.Num {
-		return false
+	if kv.currentConfig.Shards[shard] == kv.gid &&
+		kv.shardcnum[shard] == kv.currentConfig.Num {
+		return true
 	}
-	return true
+	return false
 }
 
 func (kv *ShardKV) isNextIndex(shard int, cid int64, index int64) bool {
@@ -150,6 +152,19 @@ func (kv *ShardKV) isNextIndex(shard int, cid int64, index int64) bool {
 
 func (kv *ShardKV) commitRPC(op *Op) Err {
 	for !kv.killed() {
+		if !kv.isShardValid(op.Info.Shard) {
+			if _, isleader := kv.rf.GetState(); !isleader {
+				return ErrWrongLeader
+			}
+			return ErrWrongGroup
+		}
+		if !kv.isNextIndex(op.Info.Shard, op.Info.Cid, op.Info.Index) {
+			if kv.sci[op.Info.Shard][op.Info.Cid] >= op.Info.Index {
+				return OK
+			}
+			return ErrWrongLeader
+		}
+
 		aindex, _, isLeader := kv.rf.Start(*op)
 		if !isLeader {
 			return ErrWrongLeader
@@ -160,19 +175,8 @@ func (kv *ShardKV) commitRPC(op *Op) Err {
 		for !(kv.committedInfo[aindex] != op.Info) {
 			kv.appliedCond.Wait()
 		}
-
-		if kv.isShardValid(op.Info.Shard) {
-			return ErrWrongGroup
-		}
-		if op.Info.Index <= kv.sci[op.Info.Shard][op.Info.Cid] {
-			// DPrintf("COMM\tfinish\tgid:%d\tindex:%d\top:%v", kv.gid, aindex, op)
-			return OK
-		}
-		if op.Info.Index > kv.sci[op.Info.Shard][op.Info.Cid] {
-			DPrintf("COMM\t---ERROR---\tnolinear\tgid:%d\tindex:%d\top:%v", kv.gid, aindex, op)
-			// something not linearizable happened
-		}
 	}
+
 	return ErrWrongLeader
 }
 
@@ -180,22 +184,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("RPCR\tGet\tstart\targs:%v", args)
-	if !kv.isShardValid(int(args.Shard)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
-	DPrintf("RPCR\tGet\tshard\targs:%v", args)
-	if !kv.isNextIndex(int(args.Shard), args.Cid, args.Index) {
-		if kv.sci[args.Shard][args.Cid] == args.Index {
-			reply.Err = OK
-			reply.Value = kv.kvstate[args.Shard][args.Key]
-		} else {
-			reply.Err = ErrWrongLeader
-		}
-		return
-	}
-	DPrintf("RPCR\tGet\tindex\targs:%v", args)
+	DPrintf("RPCR\tGet\tstart\tgid:%d\trid:%d\targs:%v", kv.gid, kv.me, args)
 
 	clerkinfo := &clerkInfo{
 		Shard: int(args.Shard),
@@ -219,21 +208,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
 	DPrintf("RPCR\t%s\tstart\targs:%v", args.Op, args)
-	if !kv.isShardValid(int(args.Shard)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
-	DPrintf("RPCR\t%s\tshard\targs:%v", args.Op, args)
-	if !kv.isNextIndex(int(args.Shard), args.Cid, args.Index) {
-		if kv.sci[args.Shard][args.Cid] == args.Index {
-			reply.Err = OK
-		} else {
-			reply.Err = ErrWrongLeader
-		}
-		return
-	}
-	DPrintf("RPCR\t%s\tindex\targs:%v", args.Op, args)
 
 	clerkinfo := &clerkInfo{
 		Shard: int(args.Shard),
@@ -266,7 +242,9 @@ func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply
 		reply.Err = OK
 		return
 	}
-	if args.CNum > int64(kv.currentConfig.Num) {
+	// if acnum == kcnum. a is advanced(this time a hold the s), so reject.
+	if args.CNum >= int64(kv.currentConfig.Num) {
+		DPrintf("RPCP\tRECV\tLargerShardCNum\tgid:%d\targs:%v", kv.gid, args)
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -292,15 +270,17 @@ func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply
 		for kv.committedInfo[index] == op.Info {
 			kv.appliedCond.Wait()
 		}
-		if kv.shardcnum[op.Param.(paramShardRecieve).Shard] >= op.Param.(paramShardRecieve).CNum {
-			DPrintf("RPCS\tRecieve\tfinish\tgid:%d\tsid:%d\targs:%v", kv.gid, args.Shard, args)
-			reply.Err = OK
-			break
+		if kv.appliedIndex >= index {
+			if kv.shardcnum[op.Param.(paramShardRecieve).Shard] >= op.Param.(paramShardRecieve).CNum {
+				DPrintf("RPCS\tRecieve\tfinish\tgid:%d\tsid:%d\targs:%v", kv.gid, args.Shard, args)
+				reply.Err = OK
+				break
+			}
 		}
 	}
 }
 
-func (kv *ShardKV) configUpdate(param *paramConfigUpdate) {
+func (kv *ShardKV) configUpdate(param paramConfigUpdate) {
 	if param.Config.Num <= kv.currentConfig.Num {
 		return
 	}
@@ -318,7 +298,7 @@ func (kv *ShardKV) configUpdate(param *paramConfigUpdate) {
 	DPrintf("CUPD\tfinish\tgid:%d\trid:%d\tconfig:%v", kv.gid, kv.me, kv.currentConfig)
 }
 
-func (kv *ShardKV) shardRecieve(param *paramShardRecieve) {
+func (kv *ShardKV) shardRecieve(param paramShardRecieve) {
 	if param.CNum <= kv.shardcnum[param.Shard] {
 		return
 	}
@@ -340,7 +320,7 @@ func (kv *ShardKV) shardRecieve(param *paramShardRecieve) {
 	}
 }
 
-func (kv *ShardKV) shardSuccess(param *paramShardSuccess) {
+func (kv *ShardKV) shardSuccess(param paramShardSuccess) {
 	if param.CNum != kv.shardcnum[param.Shard] {
 		return
 	}
@@ -385,14 +365,14 @@ func (kv *ShardKV) shardSender() {
 		kv.mu.Lock()
 		if len(kv.shardtarget) == 0 {
 			kv.mu.Unlock()
-			time.Sleep(_SMALL_INTERVEL)
+			time.Sleep(_SHORT_DURATION)
 			continue
 		}
 		for s, targets := range kv.shardtarget {
 			go kv.shardSendHandle(s, targets)
 		}
 		kv.mu.Unlock()
-		time.Sleep(5 * _QUARY_DURATION)
+		time.Sleep(_QUERY_DURATION) // 100ms send remoteapplied localapplied
 	}
 }
 
@@ -419,17 +399,17 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 	}
 	kv.mu.Unlock()
 
-	var sendi int
-	var target string
-	for sendi, target = range targets {
+	sendok := false
+	for _, target := range targets {
 		end := kv.make_end(target)
 		reply := RecieveShardReply{}
 		ok := end.Call("ShardKV.RecieveShard", &args, &reply)
 		if ok && reply.Err == OK {
+			sendok = true
 			break
 		}
 	}
-	if sendi == len(target) {
+	if !sendok {
 		return
 	}
 
@@ -464,8 +444,8 @@ func (kv *ShardKV) appliedChReciever() {
 
 const (
 	_APPLY_TIMEOUT  = 1000 * time.Millisecond
-	_QUARY_DURATION = 100 * time.Millisecond
-	_SMALL_INTERVEL = 10 * time.Millisecond
+	_QUERY_DURATION = 100 * time.Millisecond
+	_SHORT_DURATION = 10 * time.Millisecond
 )
 
 func (kv *ShardKV) applyTimeoutChecker() {
@@ -486,7 +466,6 @@ func (kv *ShardKV) applyTimeoutChecker() {
 		kv.mu.Unlock()
 		time.Sleep(_APPLY_TIMEOUT)
 	}
-
 }
 
 func (kv *ShardKV) commandHandle(index int, op Op) {
@@ -530,14 +509,11 @@ func (kv *ShardKV) commandHandle(index int, op Op) {
 
 	// Peer Op
 	case commandConfigUpdate:
-		z := op.Param.(paramConfigUpdate)
-		kv.configUpdate(&z)
+		kv.configUpdate(op.Param.(paramConfigUpdate))
 	case commandShardRecieve:
-		z := op.Param.(paramShardRecieve)
-		kv.shardRecieve(&z)
+		kv.shardRecieve(op.Param.(paramShardRecieve))
 	case commandShardSuccess:
-		z := op.Param.(paramShardSuccess)
-		kv.shardSuccess(&z)
+		kv.shardSuccess(op.Param.(paramShardSuccess))
 	}
 
 	kv.appliedCond.Broadcast()
@@ -570,8 +546,9 @@ func (kv *ShardKV) snapshotHandle() {
 	snap := w.Bytes()
 	kv.rf.Snapshot(kv.appliedIndex, snap)
 }
+
 func (kv *ShardKV) readSnapshot(snap []byte) bool {
-	makepersist := func() {
+	emptypersist := func() {
 		kv.appliedIndex = 0
 		kv.kvstate = make([]map[string]string, shardctrler.NShards)
 		for i := range kv.kvstate {
@@ -591,7 +568,7 @@ func (kv *ShardKV) readSnapshot(snap []byte) bool {
 	}
 
 	if snap == nil || len(snap) < 1 {
-		makepersist()
+		emptypersist()
 		return true
 	}
 	r := bytes.NewBuffer(snap)
@@ -608,7 +585,7 @@ func (kv *ShardKV) readSnapshot(snap []byte) bool {
 		d.Decode(&currentConfig) != nil ||
 		d.Decode(&shardcnum) != nil ||
 		d.Decode(&shardtarget) != nil {
-		makepersist()
+		emptypersist()
 		return false
 	}
 
