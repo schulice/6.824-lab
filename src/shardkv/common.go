@@ -49,13 +49,13 @@ type GetReply struct {
 	Value string
 }
 
-type RecieveShardArgs struct {
+type ReceiveShardArgs struct {
 	CNum       int64
 	Shard      int64
 	ClerkIndex map[int64]int64
 	KV         map[string]string
 }
 
-type RecieveShardReply struct {
+type ReceiveShardReply struct {
 	Err Err
 }

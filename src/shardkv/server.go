@@ -39,7 +39,7 @@ const (
 	commandPut
 	commandAppend
 	commandConfigUpdate
-	commandShardRecieve
+	commandShardReceive
 	commandShardSuccess
 )
 
@@ -55,7 +55,7 @@ func (c command) String() string {
 		return "APD"
 	case commandConfigUpdate:
 		return "CUP"
-	case commandShardRecieve:
+	case commandShardReceive:
 		return "SRV"
 	case commandShardSuccess:
 		return "SSC"
@@ -88,7 +88,7 @@ type paramConfigUpdate struct {
 	Config shardctrler.Config
 }
 
-type paramShardRecieve struct {
+type paramShardReceive struct {
 	Shard      int
 	CNum       int
 	ClerkIndex map[int64]int64
@@ -133,8 +133,7 @@ type ShardKV struct {
 }
 
 func (kv *ShardKV) isShardValid(shard int) bool {
-	if kv.currentConfig.Shards[shard] == kv.gid &&
-		kv.shardcnum[shard] == kv.currentConfig.Num {
+	if kv.shardcnum[shard] == kv.currentConfig.Num {
 		return true
 	}
 	return false
@@ -234,7 +233,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = kv.commitRPC(&op)
 }
 
-func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply) {
+func (kv *ShardKV) ReceiveShard(args *ReceiveShardArgs, reply *ReceiveShardReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -250,9 +249,9 @@ func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply
 	}
 
 	op := Op{
-		Command: commandShardRecieve,
+		Command: commandShardReceive,
 		Info:    clerkInfo{-1, -1, -1},
-		Param: paramShardRecieve{
+		Param: paramShardReceive{
 			CNum:       int(args.CNum),
 			Shard:      int(args.Shard),
 			ClerkIndex: args.ClerkIndex,
@@ -271,8 +270,8 @@ func (kv *ShardKV) RecieveShard(args *RecieveShardArgs, reply *RecieveShardReply
 			kv.appliedCond.Wait()
 		}
 		if kv.appliedIndex >= index {
-			if kv.shardcnum[op.Param.(paramShardRecieve).Shard] >= op.Param.(paramShardRecieve).CNum {
-				DPrintf("RPCS\tRecieve\tfinish\tgid:%d\tsid:%d\targs:%v", kv.gid, args.Shard, args)
+			if kv.shardcnum[op.Param.(paramShardReceive).Shard] >= op.Param.(paramShardReceive).CNum {
+				DPrintf("RPCS\tReceive\tfinish\tgid:%d\tsid:%d\targs:%v", kv.gid, args.Shard, args)
 				reply.Err = OK
 				break
 			}
@@ -298,7 +297,7 @@ func (kv *ShardKV) configUpdate(param paramConfigUpdate) {
 	DPrintf("CUPD\tfinish\tgid:%d\trid:%d\tconfig:%v", kv.gid, kv.me, kv.currentConfig)
 }
 
-func (kv *ShardKV) shardRecieve(param paramShardRecieve) {
+func (kv *ShardKV) shardReceive(param paramShardReceive) {
 	if param.CNum <= kv.shardcnum[param.Shard] {
 		return
 	}
@@ -391,7 +390,7 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 	for i := range kv.kvstate[s] {
 		kvs[i] = kv.kvstate[s][i]
 	}
-	args := RecieveShardArgs{
+	args := ReceiveShardArgs{
 		CNum:       int64(cnum),
 		Shard:      int64(s),
 		ClerkIndex: ci,
@@ -402,8 +401,8 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 	sendok := false
 	for _, target := range targets {
 		end := kv.make_end(target)
-		reply := RecieveShardReply{}
-		ok := end.Call("ShardKV.RecieveShard", &args, &reply)
+		reply := ReceiveShardReply{}
+		ok := end.Call("ShardKV.ReceiveShard", &args, &reply)
 		if ok && reply.Err == OK {
 			sendok = true
 			break
@@ -431,7 +430,7 @@ func (kv *ShardKV) shardSendHandle(s int, targets []string) {
 	kv.mu.Unlock()
 }
 
-func (kv *ShardKV) appliedChReciever() {
+func (kv *ShardKV) appliedChReceiver() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
@@ -510,8 +509,8 @@ func (kv *ShardKV) commandHandle(index int, op Op) {
 	// Peer Op
 	case commandConfigUpdate:
 		kv.configUpdate(op.Param.(paramConfigUpdate))
-	case commandShardRecieve:
-		kv.shardRecieve(op.Param.(paramShardRecieve))
+	case commandShardReceive:
+		kv.shardReceive(op.Param.(paramShardReceive))
 	case commandShardSuccess:
 		kv.shardSuccess(op.Param.(paramShardSuccess))
 	}
@@ -666,7 +665,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(paramPut{})
 	labgob.Register(paramAppend{})
 	labgob.Register(paramConfigUpdate{})
-	labgob.Register(paramShardRecieve{})
+	labgob.Register(paramShardReceive{})
 	labgob.Register(paramShardSuccess{})
 
 	kv := new(ShardKV)
@@ -689,7 +688,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.committedInfo = make(map[int]clerkInfo)
 	kv.lastAppliedTime = time.Now()
 
-	go kv.appliedChReciever()
+	go kv.appliedChReceiver()
 	go kv.applyTimeoutChecker()
 	go kv.snapshoter(persister)
 	go kv.configUpdateDetector()
