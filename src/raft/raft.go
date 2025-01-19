@@ -182,7 +182,11 @@ func (rf *Raft) readPersist(data []byte) {
 	// normal init
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.lastIncludedIndex = 0
+	rf.lastApplied = 0
+	rf.commitIndex = 0
 	rf.log = make([]entry, 1)
+	rf.log[0] = entry{0, 0}
 
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -359,40 +363,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("APPE\t%d\t\nlog: %d\t%v\nentry: {%d, %d}\t%v", rf.me, rf.lastIncludedIndex, rf.log, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+	if len(args.Entries) >= 0 {
+		DPrintf("RAPP\tS%d\t\nlog: %d\t%v\nentry: {%d, %d}\t%v",
+			rf.me, rf.lastIncludedIndex, rf.log,
+      args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.XTerm = 0
-	reply.XIndex = args.PrevLogIndex
+	reply.XIndex = rf.toLogIndex(len(rf.log) - 1)
 	reply.XLen = rf.toAbsIndex(len(rf.log))
-
 	// all server rule
 	if args.Term > rf.currentTerm {
 		rf.meetLargerTerm(args.Term)
 	} else if args.Term < rf.currentTerm {
 		return
 	}
-
 	// refuse outdate term update heartbeat timer
 	rf.lastHearbeat = time.Now()
-
 	// candidate rule
 	if rf.role == _ROLE_CANDIDATE {
 		rf.role = _ROLE_FOLLOWER
 	}
-
 	// refuse outbound index
-	prevIdxInside := rf.toAbsIndex(0) <= args.PrevLogIndex &&
-		args.PrevLogIndex <= rf.toAbsIndex(len(rf.log)-1)
-	if !prevIdxInside {
+	if args.PrevLogIndex < rf.toAbsIndex(0) ||
+		args.PrevLogIndex > rf.toAbsIndex(len(rf.log)-1) {
 		return
 	}
 	if rf.log[rf.toLogIndex(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.XTerm = rf.log[rf.toLogIndex(args.PrevLogIndex)].Term
-		// binary search to find oooxxxxx(y)yyyy
+		// binary search to find xxx(y)yyzzz
 		reply.XIndex = func() int {
-			l := 1 // prevent to get the log[0] which will a[-1]
+			l := 0
 			r := rf.toLogIndex(args.PrevLogIndex)
 			for l < r {
 				mid := (l + r) / 2
@@ -406,7 +409,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}()
 		return
 	}
-
 	// update follower log
 	// heartbeat will skip this
 	logChanged := false
@@ -732,13 +734,12 @@ func (rf *Raft) leader(beforeTerm int) {
 	DPrintf("STAT\tLeader\t\tP%d\tT%d", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
+	go rf.heartbeatAll(leaderTerm)
 	go rf.heartbeatController(leaderTerm)
-
-	peerNum := len(rf.peers)
-	for i := (rf.me + 1) % peerNum; i != rf.me; i = (i + 1) % peerNum {
+	servers := len(rf.peers)
+	for i := (rf.me + 1) % servers; i != rf.me; i = (i + 1) % servers {
 		go rf.commitController(leaderTerm, i)
 	}
-
 	go rf.applyChecker(leaderTerm)
 }
 
@@ -791,6 +792,56 @@ func (rf *Raft) applier() {
 	}
 }
 
+func (rf *Raft) heartbeatAll(leaderTerm int) {
+	servers := len(rf.peers)
+	rev := make(chan int)
+	wg := sync.WaitGroup{}
+	hearbeat := func(server int, args AppendEntriesArgs) {
+		defer wg.Done()
+		reply := AppendEntriesReply{}
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		if !ok {
+			return
+		}
+		rev <- reply.Term
+	}
+	rf.mu.Lock()
+	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+		rf.mu.Unlock()
+		return
+	}
+	for i := (rf.me + 1) % servers; i != rf.me; i = (i + 1) % servers {
+		args := rf.makeEmptyAppendEntriesArgs(i)
+		go hearbeat(i, args)
+	}
+	wg.Add(servers - 1)
+	rf.mu.Unlock()
+	go func() {
+		wg.Wait()
+		close(rev)
+	}()
+	for {
+		term, ok := <-rev
+		if !ok {
+			break
+		}
+		if rf.killed() {
+			continue
+		}
+		rf.mu.Lock()
+		if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+			rf.mu.Unlock()
+			break
+		}
+		if term > rf.currentTerm {
+			rf.meetLargerTerm(term)
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+	}
+}
+
 func (rf *Raft) heartbeatController(leaderTerm int) {
 	servers := len(rf.peers)
 	rev := make(chan int)
@@ -808,17 +859,6 @@ func (rf *Raft) heartbeatController(leaderTerm int) {
 	produce.Add(1)
 	go func() {
 		defer produce.Done()
-		rf.mu.Lock()
-		if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
-			rf.mu.Unlock()
-			return
-		}
-		for i := (rf.me + 1) % servers; i != rf.me; i = (i + 1) % servers {
-			args := rf.makeEmptyAppendEntriesArgs(i)
-			go hearbeat(i, args)
-		}
-		rf.mu.Unlock()
-		wg.Add(servers - 1)
 		i := rf.me
 		for !rf.killed() {
 			i = (i + 1) % servers
@@ -866,8 +906,8 @@ func (rf *Raft) heartbeatController(leaderTerm int) {
 
 // MUST mu.Lock
 func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
-	if rf.currentTerm != leaderTerm {
-		rf.mu.Unlock()
+	rf.mu.Lock()
+	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
 		return
 	}
 	args := func() (ret InstallSnapshotArgs) {
@@ -884,12 +924,13 @@ func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
 
 	reply := InstallSnapshotReply{}
 	ok := rf.sendInstallSnapshot(server, &args, &reply)
-
-	rf.mu.Lock()
 	if !ok {
 		DPrintf("SNAP\t%d\t%d\tFail send", rf.me, server)
 		return
 	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
 		return
 	}
@@ -907,10 +948,11 @@ func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
 // Lock handler
 func (rf *Raft) appendHandle(leaderTerm int, server int) {
 	// DPrintf("COMM\t%d\t%d\tinit", rf.me, server)
+	rf.mu.Lock()
 	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
 		return
 	}
-	currentNextIdx := rf.nextIndex[server]
+  currentNextIdx := rf.nextIndex[server]
 	currentLastIdx := rf.toAbsIndex(len(rf.log) - 1)
 	args := func() (ret AppendEntriesArgs) {
 		ret = rf.makeEmptyAppendEntriesArgs(server)
@@ -921,18 +963,19 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 		copy(ret.Entries[:], rf.log[begin:end]) // [) when same
 		return
 	}()
-	DPrintf("COMM\t%d\t%d", rf.me, server)
+  DPrintf("COMM\tSR%d\tTA%d\tSZ%d\tprev:{%d,%d}\tlog:%v", rf.me, server,
+    len(args.Entries), args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 	rf.mu.Unlock()
 
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, &args, &reply)
-
-	rf.mu.Lock()
-	// send error
 	if !ok {
-		DPrintf("COMM\t%d\t%d\tfail send", rf.me, server)
+		DPrintf("COMM\tSR%d\tTA%d\tfail send", rf.me, server)
 		return
 	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// leader restrain check
 	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
 		return
@@ -956,32 +999,27 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 }
 
 func (rf *Raft) commitController(leaderTerm int, server int) {
-	leaderChanged := func() bool {
-		return rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm
-	}
 	for !rf.killed() {
 		rf.mu.Lock()
-		// state checker
-		if leaderChanged() {
+		if rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm {
 			rf.mu.Unlock()
 			return
 		}
 		for !(rf.toAbsIndex(len(rf.log)-1) >= rf.nextIndex[server]) {
 			rf.commitCond.Wait()
-			if leaderChanged() || rf.killed() {
+			if rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm || rf.killed() {
 				rf.mu.Unlock()
 				return
 			}
 		}
-
 		if rf.nextIndex[server] <= rf.lastIncludedIndex {
-			rf.snapshotHandle(leaderTerm, server)
+			go rf.snapshotHandle(leaderTerm, server)
 		} else {
-			rf.appendHandle(leaderTerm, server)
+			go rf.appendHandle(leaderTerm, server)
 		}
 		rf.mu.Unlock()
-
-		// time.Sleep(SMALL_INTERVAL)
+    // just send, do not double
+		time.Sleep(HEARTBEAT_INTERVAL)
 	}
 }
 
@@ -990,10 +1028,7 @@ func (rf *Raft) quickBackup(server int, XTerm, XIndex, XLen int) {
 	// Update new next index
 	if rf.nextIndex[server] > 4*XLen {
 		// CASE XLen too short
-		rf.nextIndex[server] = XLen + 1 // refuse 0 XLen
-	} else if XTerm == 0 {
-		// CASE default, prevIdx not in follower's log
-		rf.nextIndex[server] -= 1
+		rf.nextIndex[server] = XLen // refuse 0 XLen
 	} else {
 		// binsearch to find oooyyyxx(x)zzz
 		lastXIndex := func() int {
@@ -1049,21 +1084,12 @@ func (rf *Raft) applyChecker(leaderTerm int) {
 		if rf.log[rf.toLogIndex(nextCommitIdx)].Term == rf.currentTerm &&
 			nextCommitIdx > rf.commitIndex {
 			rf.commitIndex = nextCommitIdx
-			rf.mu.Unlock()
 			rf.applyCond.Broadcast()
-			// // quick update committed index of follower, heartbeat is TOO slow
-			// for i := (rf.me + 1) % servers; i != rf.me; i = (i + 1) % servers {
-			// 	rf.mu.Lock()
-			// 	if rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm {
-			// 		rf.mu.Unlock()
-			// 		break
-			// 	}
-			// 	go rf.hearbeatPeer(leaderTerm, i)
-			// }
+			// !!HOT POINT hearbeat to update commitIndex is slow
+			go rf.heartbeatAll(leaderTerm)
 			DPrintf("COMM\t%d\tupdate", rf.me)
-		} else {
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 
 		time.Sleep(SMALL_INTERVAL)
 	}
@@ -1087,23 +1113,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	rf.currentSnapshot = rf.persister.ReadSnapshot()
-
 	// channel init
 	rf.applyCh = applyCh
-
 	// cond init
 	rf.commitCond = *sync.NewCond(&rf.mu)
 	rf.applyCond = *sync.NewCond(&rf.mu)
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 	go rf.applier()
-
 	return rf
 }
