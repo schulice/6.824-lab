@@ -372,13 +372,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.XTerm = 0
-	reply.XIndex = rf.toLogIndex(len(rf.log) - 1)
+	reply.XIndex = min(args.PrevLogIndex - 1, rf.toLogIndex(len(rf.log) - 1))
 	reply.XLen = rf.toAbsIndex(len(rf.log))
 	// all server rule
-	if args.Term > rf.currentTerm {
-		rf.meetLargerTerm(args.Term)
-	} else if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		return
+	}
+  if args.Term > rf.currentTerm {
+		rf.meetLargerTerm(args.Term)
 	}
 	// refuse outdate term update heartbeat timer
 	rf.lastHearbeat = time.Now()
@@ -734,7 +735,7 @@ func (rf *Raft) leader(beforeTerm int) {
 	DPrintf("STAT\tLeader\t\tP%d\tT%d", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
-	go rf.heartbeatAll(leaderTerm)
+	go rf.heartbeatAllWithoutMe(leaderTerm)
 	go rf.heartbeatController(leaderTerm)
 	servers := len(rf.peers)
 	for i := (rf.me + 1) % servers; i != rf.me; i = (i + 1) % servers {
@@ -792,7 +793,7 @@ func (rf *Raft) applier() {
 	}
 }
 
-func (rf *Raft) heartbeatAll(leaderTerm int) {
+func (rf *Raft) heartbeatAllWithoutMe(leaderTerm int) {
 	servers := len(rf.peers)
 	rev := make(chan int)
 	wg := sync.WaitGroup{}
@@ -1018,7 +1019,7 @@ func (rf *Raft) commitController(leaderTerm int, server int) {
 			go rf.appendHandle(leaderTerm, server)
 		}
 		rf.mu.Unlock()
-    // just send, do not double
+    // just send, do not doubt
 		time.Sleep(HEARTBEAT_INTERVAL)
 	}
 }
@@ -1086,7 +1087,7 @@ func (rf *Raft) applyChecker(leaderTerm int) {
 			rf.commitIndex = nextCommitIdx
 			rf.applyCond.Broadcast()
 			// !!HOT POINT hearbeat to update commitIndex is slow
-			go rf.heartbeatAll(leaderTerm)
+			go rf.heartbeatAllWithoutMe(leaderTerm)
 			DPrintf("COMM\t%d\tupdate", rf.me)
 		}
 		rf.mu.Unlock()
