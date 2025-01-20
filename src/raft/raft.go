@@ -35,7 +35,7 @@ import (
 const (
 	SMALL_INTERVAL     = 10 * time.Millisecond
 	HEARTBEAT_INTERVAL = 100 * time.Millisecond
-	ELECTION_TIMEOUT   = 1000 * time.Millisecond // fixed, due to the ticker random sleep
+	ELECTION_TIMEOUT   = 1000 * time.Millisecond // fixed, and the ticker will random sleep
 )
 
 // go1.15 no min
@@ -56,10 +56,9 @@ func max(a int, b int) int {
 type role int8
 
 const (
-	_ROLE_FOLLOWER     role = 0o0
-	_ROLE_WAITELECTION role = 0o1
-	_ROLE_CANDIDATE    role = 0o2
-	_ROLE_LEADER       role = 0o3
+	_ROLE_FOLLOWER     role = 0
+	_ROLE_CANDIDATE    role = 1
+	_ROLE_LEADER       role = 2
 )
 
 // debugger
@@ -67,8 +66,6 @@ func (st *role) toString() string {
 	switch *st {
 	case _ROLE_FOLLOWER:
 		return "F"
-	case _ROLE_WAITELECTION:
-		return "W"
 	case _ROLE_CANDIDATE:
 		return "C"
 	case _ROLE_LEADER:
@@ -359,26 +356,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	if len(args.Entries) >= 0 {
+	if Debug && len(args.Entries) >= 0 {
 		DPrintf("RAPP\tS%d\t\nlog: %d\t%v\nentry: {%d, %d}\t%v",
 			rf.me, rf.lastIncludedIndex, rf.log,
-      args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+			args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 	}
-
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.XTerm = 0
-	reply.XIndex = min(args.PrevLogIndex - 1, rf.toLogIndex(len(rf.log) - 1))
+	reply.XIndex = args.PrevLogIndex
 	reply.XLen = rf.toAbsIndex(len(rf.log))
 	// all server rule
 	if args.Term < rf.currentTerm {
 		return
 	}
-  if args.Term > rf.currentTerm {
+	if args.Term > rf.currentTerm {
 		rf.meetLargerTerm(args.Term)
 	}
 	// refuse outdate term update heartbeat timer
@@ -412,35 +406,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// update follower log
 	// heartbeat will skip this
-	logChanged := false
-	if rf.log[rf.toLogIndex(args.PrevLogIndex)].Term != args.PrevLogTerm {
-		rf.log = rf.log[:rf.toLogIndex(args.PrevLogIndex)]
-		logChanged = true
-	}
 	for i := range args.Entries {
-		logIdx := rf.toLogIndex(args.PrevLogIndex) + i + 1
-		if logIdx >= len(rf.log) {
+		// tolog(PrevLogIndex) in [0, log.sz - 1]
+		li := rf.toLogIndex(args.PrevLogIndex) + i + 1
+		if li == len(rf.log) ||
+			rf.log[li].Term != args.Entries[i].Term {
+			rf.log = rf.log[:li]
 			rf.log = append(rf.log, args.Entries[i:]...)
-			logChanged = true
-			break
-		} else if rf.log[logIdx].Term != args.Entries[i].Term {
-			// before
-			rf.log = rf.log[:logIdx]
-			rf.log = append(rf.log, args.Entries[i:]...)
-			logChanged = true
+			rf.persist()
 			break
 		}
-	}
-	if logChanged {
-		rf.persist()
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewIdx := args.PrevLogIndex + len(args.Entries)
-		// Snapshot
-		if lastNewIdx > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, lastNewIdx)
-			rf.applyCond.Broadcast()
-		}
+		rf.commitIndex = min(args.LeaderCommit, lastNewIdx)
+		rf.applyCond.Broadcast()
 	}
 	reply.Success = true
 }
@@ -476,33 +456,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-
-	// all server
-	if args.Term > rf.currentTerm {
-		rf.meetLargerTerm(args.Term)
-	} else if args.Term < rf.currentTerm {
-		return
-	}
-
-	// currentTerm == args.Term
+	// all server rule
+  if args.Term < rf.currentTerm {
+    return
+  }
+  if args.Term > rf.currentTerm {
+    rf.meetLargerTerm(args.Term)
+  }
+  // rev has voted for other
 	if rf.votedFor != -1 && rf.votedFor != args.CandidtateId {
 		return
 	}
-
-	// 1. lastTerm < args.lastTerm
-	// 2. lastT == alastT, len(log) <= len(alog)
-	lastLog := rf.log[len(rf.log)-1]
-	if lastLog.Term > args.LastLogTerm ||
-		lastLog.Term == args.LastLogTerm && rf.toAbsIndex(len(rf.log)-1) > args.LastLogIndex {
+  // req is not up-to-date than rev
+	lastLogTerm := rf.log[len(rf.log)-1].Term
+	if lastLogTerm > args.LastLogTerm ||
+		lastLogTerm == args.LastLogTerm && rf.toAbsIndex(len(rf.log)-1) > args.LastLogIndex {
 		return
 	}
-
 	// reset timer when voting
 	rf.lastHearbeat = time.Now()
 	if rf.votedFor == -1 {
@@ -953,7 +927,7 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
 		return
 	}
-  currentNextIdx := rf.nextIndex[server]
+	currentNextIdx := rf.nextIndex[server]
 	currentLastIdx := rf.toAbsIndex(len(rf.log) - 1)
 	args := func() (ret AppendEntriesArgs) {
 		ret = rf.makeEmptyAppendEntriesArgs(server)
@@ -964,8 +938,8 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 		copy(ret.Entries[:], rf.log[begin:end]) // [) when same
 		return
 	}()
-  DPrintf("COMM\tSR%d\tTA%d\tSZ%d\tprev:{%d,%d}\tlog:%v", rf.me, server,
-    len(args.Entries), args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+	DPrintf("COMM\tSR%d\tTA%d\tSZ%d\tprev:{%d,%d}\tlog:%v", rf.me, server,
+		len(args.Entries), args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 	rf.mu.Unlock()
 
 	reply := AppendEntriesReply{}
@@ -1019,7 +993,7 @@ func (rf *Raft) commitController(leaderTerm int, server int) {
 			go rf.appendHandle(leaderTerm, server)
 		}
 		rf.mu.Unlock()
-    // just send, do not doubt
+		// just send, do not doubt
 		time.Sleep(HEARTBEAT_INTERVAL)
 	}
 }
@@ -1027,7 +1001,7 @@ func (rf *Raft) commitController(leaderTerm int, server int) {
 func (rf *Raft) quickBackup(server int, XTerm, XIndex, XLen int) {
 	beforeNextIdx := rf.nextIndex[server]
 	// Update new next index
-	if rf.nextIndex[server] > 4*XLen {
+	if rf.nextIndex[server] > XLen {
 		// CASE XLen too short
 		rf.nextIndex[server] = XLen // refuse 0 XLen
 	} else {
