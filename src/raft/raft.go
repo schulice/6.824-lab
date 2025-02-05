@@ -62,8 +62,8 @@ const (
 )
 
 // debugger
-func (st *role) toString() string {
-	switch *st {
+func (rl *role) toString() string {
+	switch *rl {
 	case _ROLE_FOLLOWER:
 		return "F"
 	case _ROLE_CANDIDATE:
@@ -611,18 +611,18 @@ func (rf *Raft) meetLargerTerm(term int) {
 
 // mu.Unlock() handler
 // MUST mu.Lock() before call
-func (rf *Raft) candidate(beforeTerm int) {
+func (rf *Raft) candidate(curerntTerm int) {
 	rf.mu.Lock()
-	if rf.currentTerm != beforeTerm ||
+	if rf.currentTerm != curerntTerm ||
 		(rf.role != _ROLE_FOLLOWER && rf.role != _ROLE_CANDIDATE) {
 		rf.mu.Unlock()
 		return
 	}
+  curerntTerm += 1
+	rf.currentTerm = curerntTerm
 	rf.role = _ROLE_CANDIDATE
 	rf.lastHearbeat = time.Now()
-	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	electionTerm := rf.currentTerm
 	DPrintf("STAT\tCandidate\tP%d\tT%d", rf.me, rf.currentTerm)
 	args := func() (ret RequestVoteArgs) {
 		ret.Term = rf.currentTerm
@@ -634,15 +634,12 @@ func (rf *Raft) candidate(beforeTerm int) {
 	rf.mu.Unlock()
 
 	grantedCount := 1
-	peerNum := len(rf.peers)
-	getMajority := func() bool {
-		return 2*grantedCount > peerNum
-	}
+	npeer := len(rf.peers)
 	type ticket struct {
-		int
-		bool
+		Term int
+		Granted bool
 	}
-	rev := make(chan ticket, peerNum-1)
+	rev := make(chan ticket, npeer-1)
 	wg := sync.WaitGroup{}
 	sendRV := func(server int) {
 		defer wg.Done()
@@ -652,35 +649,34 @@ func (rf *Raft) candidate(beforeTerm int) {
 			DPrintf("VOTE\t%d\t%d\tfail send", rf.me, server)
 			return
 		}
-		rev <- ticket{electionTerm, reply.VoteGranted}
+		rev <- ticket{reply.Term, reply.VoteGranted}
 	}
-
-	for i := (rf.me + 1) % peerNum; i != rf.me; i = (i + 1) % peerNum {
-		wg.Add(1)
+  wg.Add(npeer - 1);
+	for i := (rf.me + 1) % npeer; i != rf.me; i = (i + 1) % npeer {
 		go sendRV(i)
 	}
 	go func() {
 		wg.Wait()
 		close(rev)
 	}()
-	for i := 0; i < peerNum-1; i++ {
+	for i := 0; i < npeer-1; i++ {
 		v, ok := <-rev
 		if !ok {
 			break
 		}
 		rf.mu.Lock()
-		if rf.currentTerm != beforeTerm+1 || rf.role != _ROLE_CANDIDATE {
+		if rf.currentTerm != curerntTerm || rf.role != _ROLE_CANDIDATE {
 			rf.mu.Unlock()
 			break
 		}
-		if v.int > rf.currentTerm {
-			rf.meetLargerTerm(v.int)
+		if v.Term > rf.currentTerm {
+			rf.meetLargerTerm(v.Term)
 			rf.mu.Unlock()
 			break
 		}
-		if v.bool {
+		if v.Granted {
 			grantedCount += 1
-			if getMajority() {
+			if 2 * grantedCount > npeer {
 				DPrintf("VOTE\tP%d\tT%d\tget major", rf.me, rf.currentTerm)
 				go rf.leader(rf.currentTerm)
 				rf.mu.Unlock()
