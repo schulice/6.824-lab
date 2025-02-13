@@ -56,19 +56,19 @@ func max(a int, b int) int {
 type role int8
 
 const (
-	_ROLE_FOLLOWER     role = 0
-	_ROLE_CANDIDATE    role = 1
-	_ROLE_LEADER       role = 2
+	roleFollower     role = 0
+	roleCandidate    role = 1
+	roleLeader       role = 2
 )
 
 // debugger
 func (rl *role) toString() string {
 	switch *rl {
-	case _ROLE_FOLLOWER:
+	case roleFollower:
 		return "F"
-	case _ROLE_CANDIDATE:
+	case roleCandidate:
 		return "C"
-	case _ROLE_LEADER:
+	case roleLeader:
 		return "L"
 	}
 	return "N"
@@ -143,7 +143,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
-	isleader = rf.role == _ROLE_LEADER
+	isleader = rf.role == roleLeader
 
 	return term, isleader
 }
@@ -378,8 +378,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// refuse outdate term update heartbeat timer
 	rf.lastHearbeat = time.Now()
 	// candidate rule
-	if rf.role == _ROLE_CANDIDATE {
-		rf.role = _ROLE_FOLLOWER
+	if rf.role == roleCandidate {
+		rf.role = roleFollower
 	}
 	// refuse outbound index
 	if args.PrevLogIndex < rf.toAbsIndex(0) ||
@@ -539,7 +539,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	rf.mu.Lock()
-	isLeader = rf.role == _ROLE_LEADER
+	isLeader = rf.role == roleLeader
 	if !isLeader {
 		rf.mu.Unlock()
 		return index, term, isLeader
@@ -603,7 +603,7 @@ func (rf *Raft) meetLargerTerm(term int) {
 
 	rf.currentTerm = term
 	rf.votedFor = -1
-	rf.role = _ROLE_FOLLOWER
+	rf.role = roleFollower
 
 	rf.persist()
 	DPrintf("STAT\tFollower\tP%d\tT%d", rf.me, rf.currentTerm)
@@ -614,13 +614,13 @@ func (rf *Raft) meetLargerTerm(term int) {
 func (rf *Raft) candidate(curerntTerm int) {
 	rf.mu.Lock()
 	if rf.currentTerm != curerntTerm ||
-		(rf.role != _ROLE_FOLLOWER && rf.role != _ROLE_CANDIDATE) {
+		(rf.role != roleFollower && rf.role != roleCandidate) {
 		rf.mu.Unlock()
 		return
 	}
   curerntTerm += 1
 	rf.currentTerm = curerntTerm
-	rf.role = _ROLE_CANDIDATE
+	rf.role = roleCandidate
 	rf.lastHearbeat = time.Now()
 	rf.votedFor = rf.me
 	DPrintf("STAT\tCandidate\tP%d\tT%d", rf.me, rf.currentTerm)
@@ -665,7 +665,7 @@ func (rf *Raft) candidate(curerntTerm int) {
 			break
 		}
 		rf.mu.Lock()
-		if rf.currentTerm != curerntTerm || rf.role != _ROLE_CANDIDATE {
+		if rf.currentTerm != curerntTerm || rf.role != roleCandidate {
 			rf.mu.Unlock()
 			break
 		}
@@ -691,11 +691,11 @@ func (rf *Raft) candidate(curerntTerm int) {
 // MUST mu.Lock() before call and immediatly EXIT the prev handler
 func (rf *Raft) leader(beforeTerm int) {
 	rf.mu.Lock()
-	if rf.currentTerm != beforeTerm || rf.role != _ROLE_CANDIDATE {
+	if rf.currentTerm != beforeTerm || rf.role != roleCandidate {
 		rf.mu.Unlock()
 		return
 	}
-	rf.role = _ROLE_LEADER
+	rf.role = roleLeader
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
@@ -726,7 +726,7 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		shouldElection := time.Now().After(rf.lastHearbeat.Add(ELECTION_TIMEOUT))
-		if shouldElection && rf.role != _ROLE_LEADER {
+		if shouldElection && rf.role != roleLeader {
 			go rf.candidate(rf.currentTerm)
 		}
 		rf.mu.Unlock()
@@ -777,7 +777,7 @@ func (rf *Raft) heartbeatAllWithoutMe(leaderTerm int) {
 		rev <- reply.Term
 	}
 	rf.mu.Lock()
-	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+	if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 		rf.mu.Unlock()
 		return
 	}
@@ -800,7 +800,7 @@ func (rf *Raft) heartbeatAllWithoutMe(leaderTerm int) {
 			continue
 		}
 		rf.mu.Lock()
-		if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+		if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 			rf.mu.Unlock()
 			break
 		}
@@ -837,7 +837,7 @@ func (rf *Raft) heartbeatController(leaderTerm int) {
 				continue
 			}
 			rf.mu.Lock()
-			if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+			if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 				rf.mu.Unlock()
 				return
 			}
@@ -862,7 +862,7 @@ func (rf *Raft) heartbeatController(leaderTerm int) {
 			continue
 		}
 		rf.mu.Lock()
-		if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+		if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 			rf.mu.Unlock()
 			break
 		}
@@ -878,7 +878,7 @@ func (rf *Raft) heartbeatController(leaderTerm int) {
 // MUST mu.Lock
 func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
 	rf.mu.Lock()
-	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+	if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 		return
 	}
 	args := func() (ret InstallSnapshotArgs) {
@@ -902,7 +902,7 @@ func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+	if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 		return
 	}
 	if rf.currentTerm < reply.Term {
@@ -920,7 +920,7 @@ func (rf *Raft) snapshotHandle(leaderTerm int, server int) {
 func (rf *Raft) appendHandle(leaderTerm int, server int) {
 	// DPrintf("COMM\t%d\t%d\tinit", rf.me, server)
 	rf.mu.Lock()
-	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+	if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 		return
 	}
 	currentNextIdx := rf.nextIndex[server]
@@ -948,7 +948,7 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// leader restrain check
-	if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+	if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 		return
 	}
 	// is commited by other thread
@@ -972,13 +972,13 @@ func (rf *Raft) appendHandle(leaderTerm int, server int) {
 func (rf *Raft) commitController(leaderTerm int, server int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm {
+		if rf.role != roleLeader || rf.currentTerm != leaderTerm {
 			rf.mu.Unlock()
 			return
 		}
 		for !(rf.toAbsIndex(len(rf.log)-1) >= rf.nextIndex[server]) {
 			rf.commitCond.Wait()
-			if rf.role != _ROLE_LEADER || rf.currentTerm != leaderTerm || rf.killed() {
+			if rf.role != roleLeader || rf.currentTerm != leaderTerm || rf.killed() {
 				rf.mu.Unlock()
 				return
 			}
@@ -1029,7 +1029,7 @@ func (rf *Raft) quickBackup(server int, XTerm, XIndex, XLen int) {
 func (rf *Raft) applyChecker(leaderTerm int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.currentTerm != leaderTerm || rf.role != _ROLE_LEADER {
+		if rf.currentTerm != leaderTerm || rf.role != roleLeader {
 			rf.mu.Unlock()
 			return
 		}
